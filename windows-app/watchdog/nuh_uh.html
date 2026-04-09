@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Guardian Shield</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Nunito:wght@900&family=Nunito:wght@400;700&display=swap');
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: 'Nunito', 'Arial Black', Arial, sans-serif;
+    background: #0d0000;
+    color: #fff;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    user-select: none;
+  }
+
+  /* ── Animated background ── */
+  .bg-glow {
+    position: fixed;
+    inset: 0;
+    background: radial-gradient(ellipse at center, #3d0000 0%, #0d0000 70%);
+    animation: bgPulse 1.2s ease-in-out infinite alternate;
+    z-index: 0;
+  }
+  @keyframes bgPulse {
+    from { background: radial-gradient(ellipse at center, #3d0000 0%, #0d0000 70%); }
+    to   { background: radial-gradient(ellipse at center, #660000 0%, #1a0000 70%); }
+  }
+
+  /* ── Scanlines ── */
+  .scanlines {
+    position: fixed;
+    inset: 0;
+    background: repeating-linear-gradient(
+      to bottom,
+      transparent 0px,
+      transparent 3px,
+      rgba(0,0,0,0.12) 3px,
+      rgba(0,0,0,0.12) 4px
+    );
+    pointer-events: none;
+    z-index: 1;
+  }
+
+  /* ── Floating particles ── */
+  #particles {
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: 1;
+  }
+  .p {
+    position: absolute;
+    border-radius: 50%;
+    animation: floatUp linear infinite;
+  }
+  @keyframes floatUp {
+    from { transform: translateY(0) scale(1); opacity: 0.9; }
+    to   { transform: translateY(-110vh) scale(0); opacity: 0; }
+  }
+
+  /* ── Main content ── */
+  .content {
+    position: relative;
+    z-index: 10;
+    text-align: center;
+    padding: 40px 20px;
+    max-width: 800px;
+    width: 100%;
+    animation: popIn 0.5s cubic-bezier(.175,.885,.32,1.275) forwards;
+  }
+  @keyframes popIn {
+    from { transform: scale(0.2) rotate(-15deg); opacity: 0; }
+    to   { transform: scale(1)   rotate(0deg);   opacity: 1; }
+  }
+
+  /* ── Top emoji row ── */
+  .emoji-row {
+    font-size: 64px;
+    margin-bottom: 8px;
+    animation: emojiRow 0.6s ease-in-out infinite alternate;
+    filter: drop-shadow(0 0 20px #ff000088);
+  }
+  @keyframes emojiRow {
+    from { transform: scale(1)    rotate(-3deg); }
+    to   { transform: scale(1.08) rotate(3deg); }
+  }
+
+  /* ── BIG NUH UH text ── */
+  .nuh-uh {
+    font-size: clamp(80px, 18vw, 180px);
+    font-weight: 900;
+    line-height: 0.9;
+    letter-spacing: -4px;
+    color: #fff;
+    text-shadow:
+      0 0 20px #ff0000,
+      0 0 60px #ff0000,
+      0 0 120px #cc0000;
+    animation: bigText 0.4s ease-in-out infinite alternate;
+    margin-bottom: 20px;
+  }
+  @keyframes bigText {
+    from { transform: scale(1)    skewX(0deg);  letter-spacing: -4px; }
+    to   { transform: scale(1.04) skewX(-1deg); letter-spacing: -2px; }
+  }
+
+  /* ── Subheading ── */
+  .caught {
+    font-size: clamp(20px, 4vw, 36px);
+    font-weight: 900;
+    color: #ff4444;
+    text-shadow: 0 0 20px #ff000088;
+    margin-bottom: 16px;
+    animation: shake 0.1s ease-in-out infinite;
+  }
+  @keyframes shake {
+    0%,100% { transform: translateX(0); }
+    25%     { transform: translateX(-6px); }
+    75%     { transform: translateX(6px); }
+  }
+
+  /* ── Description ── */
+  .desc {
+    font-size: clamp(14px, 2.5vw, 22px);
+    font-weight: 700;
+    color: #ffaaaa;
+    margin-bottom: 8px;
+    animation: fadeIn 0.4s 0.3s both;
+  }
+  .desc-sub {
+    font-size: clamp(12px, 2vw, 18px);
+    font-weight: 400;
+    color: #ff8080;
+    margin-bottom: 40px;
+    animation: fadeIn 0.4s 0.5s both;
+  }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(16px); } to { opacity: 1; transform: none; } }
+
+  /* ── Divider ── */
+  .divider {
+    border: none;
+    height: 2px;
+    background: linear-gradient(90deg, transparent, #d50000, transparent);
+    margin: 0 auto 32px;
+    width: 60%;
+    animation: fadeIn 0.4s 0.6s both;
+  }
+
+  /* ── Status row ── */
+  .status-row {
+    display: flex;
+    justify-content: center;
+    gap: 24px;
+    flex-wrap: wrap;
+    margin-bottom: 40px;
+    animation: fadeIn 0.4s 0.7s both;
+  }
+  .status-chip {
+    padding: 10px 22px;
+    border-radius: 50px;
+    font-size: 14px;
+    font-weight: 700;
+    letter-spacing: 1px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .chip-red    { background: rgba(213,0,0,0.2);   border: 2px solid #d50000; color: #ff6666; }
+  .chip-orange { background: rgba(255,109,0,0.2); border: 2px solid #ff6d00; color: #ffaa55; }
+  .chip-green  { background: rgba(0,200,100,0.2); border: 2px solid #00c864; color: #66ffaa; }
+
+  .pulse-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    animation: dotPulse 1s ease-in-out infinite;
+  }
+  .dot-red    { background: #ff4444; animation-delay: 0s; }
+  .dot-orange { background: #ff8c00; animation-delay: 0.3s; }
+  .dot-green  { background: #00c864; animation-delay: 0.6s; }
+  @keyframes dotPulse { 0%,100% { transform: scale(1); opacity: 1; } 50% { transform: scale(1.6); opacity: 0.5; } }
+
+  /* ── Countdown ── */
+  #countdown-wrap {
+    font-size: 16px;
+    color: #888;
+    animation: fadeIn 0.4s 0.9s both;
+  }
+  #countdown-wrap span {
+    color: #ff4444;
+    font-weight: 900;
+    font-size: 22px;
+  }
+
+  /* ── Edge warning stripes ── */
+  .stripe {
+    position: fixed;
+    background: repeating-linear-gradient(
+      -45deg,
+      #d50000 0px, #d50000 20px,
+      #1a0000 20px, #1a0000 40px
+    );
+    z-index: 5;
+    opacity: 0.7;
+    animation: stripeAnim 1s ease-in-out infinite alternate;
+  }
+  @keyframes stripeAnim { from { opacity: 0.5; } to { opacity: 0.9; } }
+  .stripe-top    { top: 0;    left: 0; right: 0; height: 16px; }
+  .stripe-bottom { bottom: 0; left: 0; right: 0; height: 16px; }
+  .stripe-left   { top: 0; bottom: 0; left: 0;   width: 16px;  }
+  .stripe-right  { top: 0; bottom: 0; right: 0;  width: 16px;  }
+</style>
+</head>
+<body>
+
+<!-- Background layers -->
+<div class="bg-glow"></div>
+<div class="scanlines"></div>
+<div id="particles"></div>
+
+<!-- Warning stripes around the edge -->
+<div class="stripe stripe-top"></div>
+<div class="stripe stripe-bottom"></div>
+<div class="stripe stripe-left"></div>
+<div class="stripe stripe-right"></div>
+
+<!-- Main content -->
+<div class="content">
+  <div class="emoji-row">🚫 👮 🔒</div>
+
+  <div class="nuh-uh">NUH&nbsp;UH!</div>
+
+  <div class="caught">You tried to close Guardian Shield...</div>
+
+  <p class="desc">Nice try! 😈 The app is back and watching MORE carefully now.</p>
+  <p class="desc-sub">This incident has been logged and your guardian has been notified. 🔔</p>
+
+  <hr class="divider">
+
+  <div class="status-row">
+    <div class="status-chip chip-red">
+      <span class="pulse-dot dot-red"></span>
+      Kill Attempt Detected
+    </div>
+    <div class="status-chip chip-orange">
+      <span class="pulse-dot dot-orange"></span>
+      Guardian Notified 🔔
+    </div>
+    <div class="status-chip chip-green">
+      <span class="pulse-dot dot-green"></span>
+      App Restarted ✓
+    </div>
+  </div>
+
+  <div id="countdown-wrap">
+    This screen closes in <span id="timer">8</span> seconds...
+  </div>
+</div>
+
+<script>
+  // ── Countdown ──────────────────────────────────────────────
+  let t = 8;
+  const el = document.getElementById("timer");
+  const interval = setInterval(() => {
+    t--;
+    el.textContent = t;
+    if (t <= 0) { clearInterval(interval); window.close(); }
+  }, 1000);
+
+  // ── Floating particles ──────────────────────────────────────
+  const container = document.getElementById("particles");
+  const emojis = ["🚫", "🔒", "👮", "⛔", "🛑", "❌"];
+
+  for (let i = 0; i < 25; i++) {
+    const p = document.createElement("div");
+    p.className = "p";
+    const useEmoji = Math.random() > 0.45;
+
+    if (useEmoji) {
+      p.textContent = emojis[Math.floor(Math.random() * emojis.length)];
+      p.style.fontSize = `${18 + Math.random() * 28}px`;
+      p.style.background = "none";
+    } else {
+      const size = 4 + Math.random() * 8;
+      p.style.width    = `${size}px`;
+      p.style.height   = `${size}px`;
+      p.style.background = `hsl(${Math.random() * 30}deg, 100%, 50%)`;
+    }
+
+    p.style.left             = `${Math.random() * 100}%`;
+    p.style.top              = `${70 + Math.random() * 30}%`;
+    p.style.animationDelay   = `${Math.random() * 4}s`;
+    p.style.animationDuration= `${2.5 + Math.random() * 3}s`;
+    container.appendChild(p);
+  }
+
+  // ── Periodic screen flash ───────────────────────────────────
+  let flashCount = 0;
+  function flash() {
+    if (flashCount >= 3) return;
+    document.body.style.background = "#660000";
+    setTimeout(() => { document.body.style.background = ""; }, 120);
+    flashCount++;
+    setTimeout(flash, 400);
+  }
+  setTimeout(flash, 100);
+</script>
+</body>
+</html>

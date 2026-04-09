@@ -1,0 +1,523 @@
+<!DOCTYPE html>
+
+<html class="light" lang="en"><head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700;800&amp;family=Inter:wght@400;500;600&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<style>
+        .material-symbols-outlined {
+            font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+        }
+        .glass-panel {
+            background: rgba(255, 255, 255, 0.7);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+        }
+
+        @keyframes slideIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .animate-slide-in {
+            animation: slideIn 0.4s ease forwards;
+        }
+
+        @keyframes breathe {
+            0%, 100% { transform: scale(1); opacity: 1; }
+            50% { transform: scale(1.02); opacity: 0.95; }
+        }
+        .animate-breathe {
+            animation: breathe 4s ease-in-out infinite;
+        }
+
+        @keyframes glow {
+            0%, 100% { box-shadow: 0 0 5px rgba(0, 106, 98, 0.2); }
+            50% { box-shadow: 0 0 15px rgba(0, 106, 98, 0.4); }
+        }
+        .animate-glow {
+            animation: glow 2s ease-in-out infinite;
+        }
+
+        @keyframes shimmer {
+            0% { background-position: -200% 0; }
+            100% { background-position: 200% 0; }
+        }
+        .shimmer-effect {
+            background: linear-gradient(90deg, rgba(255,255,255,0) 0%, rgba(255,255,255,0.4) 50%, rgba(255,255,255,0) 100%);
+            background-size: 200% 100%;
+            animation: shimmer 3s infinite;
+        }
+
+        .toggle-dot {
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+
+        #add-url-modal.hidden {
+            display: none;
+        }
+    </style>
+<script id="tailwind-config">
+      tailwind.config = {
+        darkMode: "class",
+        theme: {
+          extend: {
+            "colors": {
+                    "surface-variant": "#e0e3e5",
+                    "on-tertiary-container": "#79ebdd",
+                    "inverse-surface": "#2d3133",
+                    "inverse-primary": "#87d0f2",
+                    "on-tertiary-fixed-variant": "#005049",
+                    "surface-container-low": "#f2f4f6",
+                    "surface-container-lowest": "#ffffff",
+                    "outline": "#70787e",
+                    "outline-variant": "#bfc8cd",
+                    "on-primary-fixed": "#001f2a",
+                    "on-secondary-container": "#536772",
+                    "secondary": "#4d616c",
+                    "error": "#ba1a1a",
+                    "surface-dim": "#d8dadc",
+                    "on-surface-variant": "#3f484d",
+                    "tertiary-container": "#006a62",
+                    "surface": "#f7f9fb",
+                    "secondary-fixed-dim": "#b4cad6",
+                    "on-primary": "#ffffff",
+                    "secondary-fixed": "#d0e6f3",
+                    "surface-container": "#eceef0",
+                    "surface-container-highest": "#e0e3e5",
+                    "surface-tint": "#016684",
+                    "on-secondary-fixed-variant": "#364954",
+                    "on-tertiary-fixed": "#00201d",
+                    "surface-container-high": "#e6e8ea",
+                    "inverse-on-surface": "#eff1f3",
+                    "secondary-container": "#d0e6f3",
+                    "on-background": "#191c1e",
+                    "on-surface": "#191c1e",
+                    "on-primary-fixed-variant": "#004d64",
+                    "error-container": "#ffdad6",
+                    "on-secondary": "#ffffff",
+                    "on-tertiary": "#ffffff",
+                    "tertiary-fixed-dim": "#66d9cc",
+                    "on-error": "#ffffff",
+                    "on-error-container": "#93000a",
+                    "primary-container": "#006684",
+                    "surface-bright": "#f7f9fb",
+                    "primary-fixed-dim": "#87d0f2",
+                    "tertiary-fixed": "#84f5e8",
+                    "primary-fixed": "#bee9ff",
+                    "tertiary": "#005049",
+                    "on-secondary-fixed": "#081e27",
+                    "on-primary-container": "#a2e1ff",
+                    "background": "#f7f9fb",
+                    "primary": "#004d64"
+            },
+            "borderRadius": {
+                    "DEFAULT": "0.25rem",
+                    "lg": "0.5rem",
+                    "xl": "0.75rem",
+                    "full": "9999px"
+            },
+            "fontFamily": {
+                    "headline": ["Manrope"],
+                    "body": ["Inter"],
+                    "label": ["Inter"]
+            }
+          },
+        },
+      }
+    </script>
+</head>
+<body class="bg-surface font-body text-on-surface min-h-screen">
+<aside class="h-screen w-64 fixed left-0 top-0 z-50 bg-slate-100 dark:bg-slate-950 flex flex-col p-6 gap-2 border-r-0">
+<div class="mb-8 px-2">
+<h1 class="font-headline font-extrabold text-cyan-950 dark:text-white text-xl tracking-tight">The Guardian</h1>
+<p class="text-xs text-secondary font-medium tracking-wide">Serene Vigilance</p>
+</div>
+<nav class="flex-1 flex flex-col gap-1">
+<a class="flex items-center gap-3 px-4 py-3 text-slate-600 dark:text-slate-400 hover:bg-slate-200/50 dark:hover:bg-slate-800/50 rounded-xl transition-all duration-300" href="{{DATA:SCREEN:SCREEN_6}}">
+<span class="material-symbols-outlined" data-icon="dashboard">dashboard</span>
+<span class="text-sm font-medium">Dashboard</span>
+</a>
+<a class="flex items-center gap-3 px-4 py-3 text-slate-600 dark:text-slate-400 hover:bg-slate-200/50 dark:hover:bg-slate-800/50 rounded-xl transition-all duration-300" href="{{DATA:SCREEN:SCREEN_9}}">
+<span class="material-symbols-outlined" data-icon="analytics">analytics</span>
+<span class="text-sm font-medium">Activity Monitoring</span>
+</a>
+<a class="flex items-center gap-3 px-4 py-3 bg-white dark:bg-cyan-900/30 text-cyan-900 dark:text-cyan-100 rounded-xl shadow-sm transition-all duration-300" href="#">
+<span class="material-symbols-outlined" data-icon="gavel" style="font-variation-settings: 'FILL' 1;">gavel</span>
+<span class="text-sm font-semibold">Rules &amp; Limits</span>
+</a>
+<a class="flex items-center gap-3 px-4 py-3 text-slate-600 dark:text-slate-400 hover:bg-slate-200/50 dark:hover:bg-slate-800/50 rounded-xl transition-all duration-300" href="#">
+<span class="material-symbols-outlined" data-icon="near_me">near_me</span>
+<span class="text-sm font-medium">Location Tracking</span>
+</a>
+<a class="flex items-center gap-3 px-4 py-3 text-slate-600 dark:text-slate-400 hover:bg-slate-200/50 dark:hover:bg-slate-800/50 rounded-xl transition-all duration-300" href="{{DATA:SCREEN:SCREEN_10}}">
+<span class="material-symbols-outlined" data-icon="devices_other">devices_other</span>
+<span class="text-sm font-medium">Connected Devices</span>
+</a>
+<a class="flex items-center gap-3 px-4 py-3 text-slate-600 dark:text-slate-400 hover:bg-slate-200/50 dark:hover:bg-slate-800/50 rounded-xl transition-all duration-300" href="#">
+<span class="material-symbols-outlined" data-icon="settings">settings</span>
+<span class="text-sm font-medium">Account Settings</span>
+</a>
+</nav>
+<div class="mt-auto pt-6 flex flex-col gap-1 border-t border-slate-200/50">
+<a class="flex items-center gap-3 px-4 py-3 text-slate-600 dark:text-slate-400 hover:bg-slate-200/50 dark:hover:bg-slate-800/50 rounded-xl transition-all" href="#">
+<span class="material-symbols-outlined" data-icon="contact_support">contact_support</span>
+<span class="text-sm font-medium">Support</span>
+</a>
+<a class="flex items-center gap-3 px-4 py-3 text-slate-600 dark:text-slate-400 hover:bg-slate-200/50 dark:hover:bg-slate-800/50 rounded-xl transition-all" href="#">
+<span class="material-symbols-outlined" data-icon="logout">logout</span>
+<span class="text-sm font-medium">Sign Out</span>
+</a>
+</div>
+</aside>
+<main class="ml-64 min-h-screen">
+<header class="bg-slate-50/80 dark:bg-slate-900/80 backdrop-blur-md sticky top-0 z-40 flex justify-between items-center w-full px-8 py-4 no-border">
+<h2 class="text-2xl font-bold font-headline text-cyan-900 dark:text-cyan-100">Web Filtering</h2>
+<div class="flex items-center gap-6">
+<div class="relative group">
+<span class="material-symbols-outlined absolute left-3 top-1/2 -translate-y-1/2 text-outline-variant group-focus-within:text-primary transition-colors">search</span>
+<input class="pl-10 pr-4 py-2 bg-surface-container-low border-none rounded-full text-sm w-64 focus:ring-2 focus:ring-primary/20 focus:bg-surface-container-lowest transition-all" placeholder="Search filtered sites..." type="text"/>
+</div>
+<div class="flex items-center gap-2">
+<button class="p-2 text-slate-500 hover:bg-slate-200/50 dark:hover:bg-slate-700/50 rounded-full transition-colors">
+<span class="material-symbols-outlined" data-icon="notifications">notifications</span>
+</button>
+<button class="p-2 text-slate-500 hover:bg-slate-200/50 dark:hover:bg-slate-700/50 rounded-full transition-colors">
+<span class="material-symbols-outlined" data-icon="help_outline">help_outline</span>
+</button>
+<div class="w-10 h-10 rounded-full overflow-hidden ml-2 bg-secondary-container flex items-center justify-center">
+<img alt="User Profile" class="w-full h-full object-cover" src="https://lh3.googleusercontent.com/aida-public/AB6AXuCSyS7CarkLrLBe6uKd23iPOjsCWnJGr4pQV9xExEg3O1bkmowyOLcLHoLyYgYz5g2K8DzGjMT1X8DK0ntzn3efW493hDEuJXzie45l8nBe0_2MJ3ubUou0pveeBx-svyHgDoHoOQRGnS8fw_sDAnhGaW-AuQbD7NwAx8T_ScUoctCOICQb_aS8tnFHm6ens-oRzIpBiXUToohPzKAic5zlgtz7le3rLYxMpqBd7dyIPXPIxDfedmbemmPWa6ayJGCuthOBkQLMMQ8"/>
+</div>
+</div>
+</div>
+</header>
+<div class="p-8 max-w-7xl mx-auto space-y-8">
+<section class="grid grid-cols-1 md:grid-cols-3 gap-6">
+<div class="col-span-1 md:col-span-2 bg-surface-container-lowest rounded-xl p-8 border-none flex flex-col gap-6">
+<div class="flex items-center justify-between">
+<div>
+<h3 class="font-headline text-xl font-bold text-on-surface">Content Categories</h3>
+<p class="text-sm text-on-surface-variant font-body mt-1">Automatically block access to broad categories of content.</p>
+</div>
+<span class="relative overflow-hidden px-3 py-1 bg-tertiary/10 text-tertiary text-xs font-bold rounded-full uppercase tracking-widest animate-glow">
+<div class="absolute inset-0 shimmer-effect pointer-events-none"></div>
+    Global Protection Active
+</span>
+</div>
+<div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+<div class="group p-5 bg-surface-container-low rounded-xl flex items-center justify-between hover:bg-surface-container transition-all duration-300 cursor-pointer" onclick="const cb = this.querySelector('input'); cb.checked = !cb.checked; cb.dispatchEvent(new Event('change', {bubbles: true}));">
+<div class="flex items-center gap-4">
+<div class="w-12 h-12 rounded-xl bg-error-container flex items-center justify-center text-on-error-container">
+<span class="material-symbols-outlined" data-icon="warning">warning</span>
+</div>
+<div>
+<h4 class="font-bold text-on-surface text-sm">Adult Content</h4>
+<p class="text-xs text-on-surface-variant">Pornography and explicit media</p>
+</div>
+</div>
+<label class="relative inline-flex items-center cursor-pointer" onclick="event.stopPropagation();">
+<input checked="" class="sr-only peer" type="checkbox"/>
+<div class="w-11 h-6 bg-surface-variant peer-focus:outline-none rounded-full peer transition-all duration-300 peer-checked:bg-primary after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:after:translate-x-full peer-checked:after:border-white toggle-dot"></div>
+</label>
+</div>
+<div class="group p-5 bg-surface-container-low rounded-xl flex items-center justify-between hover:bg-surface-container transition-all duration-300 cursor-pointer" onclick="const cb = this.querySelector('input'); cb.checked = !cb.checked; cb.dispatchEvent(new Event('change', {bubbles: true}));">
+<div class="flex items-center gap-4">
+<div class="w-12 h-12 rounded-xl bg-secondary-container flex items-center justify-center text-on-secondary-container">
+<span class="material-symbols-outlined" data-icon="sports_esports">sports_esports</span>
+</div>
+<div>
+<h4 class="font-bold text-on-surface text-sm">Online Gaming</h4>
+<p class="text-xs text-on-surface-variant">Multiplayer and gambling sites</p>
+</div>
+</div>
+<label class="relative inline-flex items-center cursor-pointer" onclick="event.stopPropagation();">
+<input class="sr-only peer" type="checkbox"/>
+<div class="w-11 h-6 bg-surface-variant peer-focus:outline-none rounded-full peer transition-all duration-300 peer-checked:bg-primary after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:after:translate-x-full peer-checked:after:border-white toggle-dot"></div>
+</label>
+</div>
+<div class="group p-5 bg-surface-container-low rounded-xl flex items-center justify-between hover:bg-surface-container transition-all duration-300 cursor-pointer" onclick="const cb = this.querySelector('input'); cb.checked = !cb.checked; cb.dispatchEvent(new Event('change', {bubbles: true}));">
+<div class="flex items-center gap-4">
+<div class="w-12 h-12 rounded-xl bg-tertiary-container flex items-center justify-center text-white">
+<span class="material-symbols-outlined" data-icon="share">share</span>
+</div>
+<div>
+<h4 class="font-bold text-on-surface text-sm">Social Media</h4>
+<p class="text-xs text-on-surface-variant">Networking and chat platforms</p>
+</div>
+</div>
+<label class="relative inline-flex items-center cursor-pointer" onclick="event.stopPropagation();">
+<input checked="" class="sr-only peer" type="checkbox"/>
+<div class="w-11 h-6 bg-surface-variant peer-focus:outline-none rounded-full peer transition-all duration-300 peer-checked:bg-primary after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:after:translate-x-full peer-checked:after:border-white toggle-dot"></div>
+</label>
+</div>
+<div class="group p-5 bg-surface-container-low rounded-xl flex items-center justify-between hover:bg-surface-container transition-all duration-300 cursor-pointer" onclick="const cb = this.querySelector('input'); cb.checked = !cb.checked; cb.dispatchEvent(new Event('change', {bubbles: true}));">
+<div class="flex items-center gap-4">
+<div class="w-12 h-12 rounded-xl bg-primary-container flex items-center justify-center text-white">
+<span class="material-symbols-outlined" data-icon="shopping_cart">shopping_cart</span>
+</div>
+<div>
+<h4 class="font-bold text-on-surface text-sm">E-commerce</h4>
+<p class="text-xs text-on-surface-variant">Online stores and marketplaces</p>
+</div>
+</div>
+<label class="relative inline-flex items-center cursor-pointer" onclick="event.stopPropagation();">
+<input class="sr-only peer" type="checkbox"/>
+<div class="w-11 h-6 bg-surface-variant peer-focus:outline-none rounded-full peer transition-all duration-300 peer-checked:bg-primary after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:after:translate-x-full peer-checked:after:border-white toggle-dot"></div>
+</label>
+</div>
+</div>
+</div>
+<div class="col-span-1 bg-primary text-white rounded-xl p-8 flex flex-col justify-between relative overflow-hidden animate-breathe">
+<div class="absolute -right-4 -bottom-4 opacity-10">
+<span class="material-symbols-outlined text-[160px]" data-icon="verified_user">verified_user</span>
+</div>
+<div class="relative z-10">
+<h3 class="font-headline text-xl font-bold flex items-center gap-2">
+    Secure Core™
+    <span class="flex h-2 w-2 rounded-full bg-tertiary-fixed shadow-[0_0_8px_rgba(132,245,232,0.8)]"></span>
+</h3>
+<p class="text-sm text-on-primary-container font-body mt-2">Our AI-driven filtering engine analyzes URLs in real-time to prevent access to emerging threats.</p>
+</div>
+<div class="mt-8 space-y-4 relative z-10">
+<div class="flex items-center gap-3">
+<span class="material-symbols-outlined text-tertiary-fixed" data-icon="check_circle">check_circle</span>
+<span class="text-sm font-medium">Real-time DB updates</span>
+</div>
+<div class="flex items-center gap-3">
+<span class="material-symbols-outlined text-tertiary-fixed" data-icon="check_circle">check_circle</span>
+<span class="text-sm font-medium">Encrypted DNS enabled</span>
+</div>
+<button class="w-full mt-6 py-3 bg-surface-container-lowest text-primary font-bold rounded-full hover:bg-surface-bright hover:shadow-lg transition-all duration-300 active:scale-95" id="configure-engine-btn">Configure Engine</button>
+</div>
+</div>
+</section>
+<section class="bg-surface-container-lowest rounded-xl p-8 border-none">
+<div class="flex items-center justify-between mb-8">
+<div>
+<h3 class="font-headline text-xl font-bold text-on-surface">Custom URL Blocklist</h3>
+<p class="text-sm text-on-surface-variant font-body mt-1">Specify individual websites you want to restrict or allow.</p>
+</div>
+<button class="flex items-center gap-2 px-6 py-3 bg-gradient-to-br from-primary to-primary-container text-white font-bold rounded-full shadow-lg shadow-primary/20 hover:scale-105 active:scale-95 transition-all duration-300" id="add-url-btn">
+<span class="material-symbols-outlined" data-icon="add">add</span>
+                        Add Custom URL
+                    </button>
+</div>
+<div class="space-y-2 overflow-hidden" id="url-list">
+<div class="flex items-center justify-between p-4 bg-surface-container-low/50 rounded-xl hover:bg-surface-container-low transition-all duration-300 animate-slide-in" style="animation-delay: 0.1s;">
+<div class="flex items-center gap-6">
+<div class="w-10 h-10 rounded-lg bg-surface-container-lowest flex items-center justify-center text-primary border border-outline-variant/20">
+<span class="material-symbols-outlined" data-icon="public">public</span>
+</div>
+<div>
+<h4 class="font-bold text-on-surface text-sm">tiktok.com</h4>
+<p class="text-xs text-on-surface-variant">Added: Oct 12, 2023</p>
+</div>
+</div>
+<div class="flex items-center gap-12">
+<div class="flex flex-col items-end">
+<span class="text-[10px] font-bold text-outline-variant uppercase tracking-widest mb-1">Status</span>
+<span class="text-xs font-semibold text-error px-2 py-0.5 bg-error-container/30 rounded-md">Blocked</span>
+</div>
+<div class="flex items-center gap-4">
+<button class="p-2 text-outline hover:text-primary hover:bg-white rounded-full transition-all">
+<span class="material-symbols-outlined" data-icon="edit">edit</span>
+</button>
+<button class="p-2 text-outline hover:text-error hover:bg-white rounded-full transition-all" onclick="this.closest('.animate-slide-in').remove()">
+<span class="material-symbols-outlined" data-icon="delete">delete</span>
+</button>
+</div>
+</div>
+</div>
+<div class="flex items-center justify-between p-4 bg-surface-container-low/50 rounded-xl hover:bg-surface-container-low transition-all duration-300 animate-slide-in" style="animation-delay: 0.2s;">
+<div class="flex items-center gap-6">
+<div class="w-10 h-10 rounded-lg bg-surface-container-lowest flex items-center justify-center text-primary border border-outline-variant/20">
+<span class="material-symbols-outlined" data-icon="public">public</span>
+</div>
+<div>
+<h4 class="font-bold text-on-surface text-sm">roblox.com</h4>
+<p class="text-xs text-on-surface-variant">Added: Sep 05, 2023</p>
+</div>
+</div>
+<div class="flex items-center gap-12">
+<div class="flex flex-col items-end">
+<span class="text-[10px] font-bold text-outline-variant uppercase tracking-widest mb-1">Status</span>
+<span class="text-xs font-semibold text-error px-2 py-0.5 bg-error-container/30 rounded-md">Blocked</span>
+</div>
+<div class="flex items-center gap-4">
+<button class="p-2 text-outline hover:text-primary hover:bg-white rounded-full transition-all">
+<span class="material-symbols-outlined" data-icon="edit">edit</span>
+</button>
+<button class="p-2 text-outline hover:text-error hover:bg-white rounded-full transition-all" onclick="this.closest('.animate-slide-in').remove()">
+<span class="material-symbols-outlined" data-icon="delete">delete</span>
+</button>
+</div>
+</div>
+</div>
+<div class="flex items-center justify-between p-4 bg-surface-container-low/50 rounded-xl hover:bg-surface-container-low transition-all duration-300 animate-slide-in" style="animation-delay: 0.3s;">
+<div class="flex items-center gap-6">
+<div class="w-10 h-10 rounded-lg bg-surface-container-lowest flex items-center justify-center text-tertiary border border-outline-variant/20">
+<span class="material-symbols-outlined" data-icon="public">public</span>
+</div>
+<div>
+<h4 class="font-bold text-on-surface text-sm">khanacademy.org</h4>
+<p class="text-xs text-on-surface-variant">Added: Aug 20, 2023</p>
+</div>
+</div>
+<div class="flex items-center gap-12">
+<div class="flex flex-col items-end">
+<span class="text-[10px] font-bold text-outline-variant uppercase tracking-widest mb-1">Status</span>
+<span class="text-xs font-semibold text-tertiary px-2 py-0.5 bg-tertiary/10 rounded-md">Always Allowed</span>
+</div>
+<div class="flex items-center gap-4">
+<button class="p-2 text-outline hover:text-primary hover:bg-white rounded-full transition-all">
+<span class="material-symbols-outlined" data-icon="edit">edit</span>
+</button>
+<button class="p-2 text-outline hover:text-error hover:bg-white rounded-full transition-all" onclick="this.closest('.animate-slide-in').remove()">
+<span class="material-symbols-outlined" data-icon="delete">delete</span>
+</button>
+</div>
+</div>
+</div>
+<div class="flex items-center justify-between p-4 bg-surface-container-low/50 rounded-xl hover:bg-surface-container-low transition-all duration-300 animate-slide-in" style="animation-delay: 0.4s;">
+<div class="flex items-center gap-6">
+<div class="w-10 h-10 rounded-lg bg-surface-container-lowest flex items-center justify-center text-primary border border-outline-variant/20">
+<span class="material-symbols-outlined" data-icon="public">public</span>
+</div>
+<div>
+<h4 class="font-bold text-on-surface text-sm">discord.com</h4>
+<p class="text-xs text-on-surface-variant">Added: Nov 01, 2023</p>
+</div>
+</div>
+<div class="flex items-center gap-12">
+<div class="flex flex-col items-end">
+<span class="text-[10px] font-bold text-outline-variant uppercase tracking-widest mb-1">Status</span>
+<span class="text-xs font-semibold text-error px-2 py-0.5 bg-error-container/30 rounded-md">Blocked</span>
+</div>
+<div class="flex items-center gap-4">
+<button class="p-2 text-outline hover:text-primary hover:bg-white rounded-full transition-all">
+<span class="material-symbols-outlined" data-icon="edit">edit</span>
+</button>
+<button class="p-2 text-outline hover:text-error hover:bg-white rounded-full transition-all" onclick="this.closest('.animate-slide-in').remove()">
+<span class="material-symbols-outlined" data-icon="delete">delete</span>
+</button>
+</div>
+</div>
+</div>
+</div>
+<div class="mt-8 flex justify-center">
+<button class="text-sm font-bold text-primary hover:underline underline-offset-4 flex items-center gap-1 transition-all duration-300" onclick="this.nextElementSibling.classList.toggle('hidden'); this.querySelector('.material-symbols-outlined').classList.toggle('rotate-180');">
+                        View 14 more hidden items
+                        <span class="material-symbols-outlined text-sm transition-transform duration-300" data-icon="expand_more">expand_more</span>
+</button>
+<div class="hidden transition-all duration-500 ease-in-out">
+<!-- Extra items would go here in a real app -->
+</div>
+</div>
+</section>
+<section class="grid grid-cols-1 md:grid-cols-2 gap-6 pb-12">
+<div class="bg-surface-container-low rounded-xl p-6 flex items-start gap-4 hover:shadow-md transition-shadow duration-300">
+<div class="w-10 h-10 rounded-full bg-primary/10 flex items-center justify-center text-primary shrink-0">
+<span class="material-symbols-outlined" data-icon="auto_awesome">auto_awesome</span>
+</div>
+<div>
+<h4 class="font-bold text-on-surface">Smart Suggestions</h4>
+<p class="text-sm text-on-surface-variant mt-1">Based on recent attempts, you might want to consider blocking <b>unblocked.game-site.io</b>. Access was attempted 12 times yesterday.</p>
+<div class="mt-4 flex gap-3">
+<button class="px-4 py-2 bg-primary text-white text-xs font-bold rounded-lg hover:brightness-110 hover:shadow-md transition-all active:scale-95">Block Now</button>
+<button class="px-4 py-2 bg-white text-on-surface text-xs font-bold rounded-lg border border-outline-variant/30 hover:bg-surface transition-all">Dismiss</button>
+</div>
+</div>
+</div>
+<div class="bg-secondary-container/30 rounded-xl p-6 flex items-start gap-4 hover:shadow-md transition-shadow duration-300">
+<div class="w-10 h-10 rounded-full bg-secondary/10 flex items-center justify-center text-secondary shrink-0">
+<span class="material-symbols-outlined" data-icon="schedule">schedule</span>
+</div>
+<div>
+<h4 class="font-bold text-on-surface">Scheduled Filters</h4>
+<p class="text-sm text-on-surface-variant mt-1">You have "Strict Mode" enabled between 8:00 PM and 7:00 AM daily. Custom rules are temporarily overridden during these hours.</p>
+<button class="mt-4 text-xs font-bold text-secondary flex items-center gap-1 hover:underline group transition-all">
+                            Edit Schedule
+                            <span class="material-symbols-outlined text-xs group-hover:translate-x-1 transition-transform" data-icon="arrow_forward">arrow_forward</span>
+</button>
+</div>
+</div>
+</section>
+</div>
+</main>
+<!-- Simulated Modal for Add Custom URL -->
+<div class="fixed inset-0 z-[60] flex items-center justify-center bg-on-background/40 backdrop-blur-sm hidden" id="add-url-modal">
+<div class="bg-surface-container-lowest rounded-2xl p-8 w-full max-w-md shadow-2xl animate-slide-in">
+<h3 class="font-headline text-xl font-bold mb-4">Add Custom URL Rule</h3>
+<div class="space-y-4">
+<div>
+<label class="block text-xs font-bold text-outline-variant uppercase tracking-wider mb-2">Website Address</label>
+<input class="w-full px-4 py-3 bg-surface-container-low border-none rounded-xl text-sm focus:ring-2 focus:ring-primary/20" id="modal-url-input" placeholder="e.g. example.com" type="text"/>
+</div>
+<div>
+<label class="block text-xs font-bold text-outline-variant uppercase tracking-wider mb-2">Rule Type</label>
+<div class="flex gap-2">
+<button class="flex-1 py-2 rounded-lg bg-primary text-white text-sm font-bold shadow-sm">Block</button>
+<button class="flex-1 py-2 rounded-lg bg-surface-container text-on-surface text-sm font-bold">Always Allow</button>
+</div>
+</div>
+</div>
+<div class="mt-8 flex gap-3">
+<button class="flex-1 py-3 bg-primary text-white font-bold rounded-xl hover:brightness-110 transition-all active:scale-95" onclick="document.getElementById('add-url-modal').classList.add('hidden')">Save Rule</button>
+<button class="px-6 py-3 bg-surface-container-high text-on-surface font-bold rounded-xl hover:bg-surface-container-highest transition-all active:scale-95" onclick="document.getElementById('add-url-modal').classList.add('hidden')">Cancel</button>
+</div>
+</div>
+</div>
+<script>
+    // Side navigation links functional routing is handled via href in the HTML
+
+    // Handle toggle switch interactions
+    document.querySelectorAll('input[type="checkbox"]').forEach(toggle => {
+        toggle.addEventListener('change', function() {
+            const parent = this.closest('.group');
+            if (this.checked) {
+                parent.classList.add('ring-2', 'ring-primary/20');
+            } else {
+                parent.classList.remove('ring-2', 'ring-primary/20');
+            }
+        });
+    });
+
+    // Add Custom URL functionality
+    const addUrlBtn = document.getElementById('add-url-btn');
+    const addUrlModal = document.getElementById('add-url-modal');
+    
+    addUrlBtn.addEventListener('click', () => {
+        addUrlModal.classList.remove('hidden');
+        document.getElementById('modal-url-input').focus();
+    });
+
+    // Close modal on escape key
+    window.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') {
+            addUrlModal.classList.add('hidden');
+        }
+    });
+
+    // Configure Engine interaction
+    const configureBtn = document.getElementById('configure-engine-btn');
+    configureBtn.addEventListener('click', function() {
+        const originalText = this.innerText;
+        this.innerHTML = '<span class="material-symbols-outlined animate-spin mr-2">settings</span> Processing...';
+        this.disabled = true;
+        
+        setTimeout(() => {
+            this.innerHTML = '<span class="material-symbols-outlined mr-2">check_circle</span> Engine Optimized';
+            this.classList.replace('bg-surface-container-lowest', 'bg-tertiary-fixed');
+            this.classList.replace('text-primary', 'text-tertiary');
+            
+            setTimeout(() => {
+                this.innerHTML = originalText;
+                this.classList.replace('bg-tertiary-fixed', 'bg-surface-container-lowest');
+                this.classList.replace('text-tertiary', 'text-primary');
+                this.disabled = false;
+            }, 2000);
+        }, 1500);
+    });
+</script>
+</body></html>

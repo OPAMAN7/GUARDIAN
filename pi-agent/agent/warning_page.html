@@ -1,0 +1,461 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Guardian Shield — Site Blocked</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Nunito:wght@400;700;900&display=swap');
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --c1: #ffd600; --c2: #ff6d00; --c3: #d50000;
+    --glow1: #ffd60066; --glow3: #d5000066;
+  }
+
+  body {
+    font-family: 'Nunito', 'Arial Rounded MT Bold', Arial, sans-serif;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    transition: background 0.8s;
+  }
+
+  /* ── Backgrounds per level ── */
+  body.lvl1 { background: linear-gradient(135deg, #1a1200 0%, #3d2e00 50%, #1a1200 100%); }
+  body.lvl2 { background: linear-gradient(135deg, #1a0800 0%, #3d1200 50%, #1a0800 100%); }
+  body.lvl3 { background: linear-gradient(135deg, #1a0000 0%, #3d0000 50%, #1a0000 100%); }
+
+  /* ── Particles ── */
+  #particles { position: fixed; inset: 0; pointer-events: none; z-index: 0; }
+  .particle {
+    position: absolute;
+    border-radius: 50%;
+    opacity: 0;
+    animation: floatUp 3s ease-in infinite;
+  }
+  @keyframes floatUp {
+    0%   { transform: translateY(0) scale(1); opacity: 0.8; }
+    100% { transform: translateY(-100vh) scale(0); opacity: 0; }
+  }
+
+  /* ── Main container ── */
+  .card {
+    position: relative;
+    z-index: 10;
+    text-align: center;
+    padding: 60px 80px;
+    border-radius: 32px;
+    max-width: 720px;
+    width: 90%;
+    animation: popIn 0.6s cubic-bezier(.175,.885,.32,1.275) forwards;
+  }
+  body.lvl1 .card { background: rgba(255,214,0,0.08); border: 3px solid #ffd600; box-shadow: 0 0 60px #ffd60040, 0 0 120px #ffd60020; }
+  body.lvl2 .card { background: rgba(255,109,0,0.08); border: 3px solid #ff6d00; box-shadow: 0 0 60px #ff6d0050, 0 0 120px #ff6d0030; }
+  body.lvl3 .card { background: rgba(213,0,0,0.10);   border: 3px solid #d50000; box-shadow: 0 0 60px #d5000060, 0 0 140px #d5000030; }
+
+  @keyframes popIn {
+    from { transform: scale(0.4) rotate(-8deg); opacity: 0; }
+    to   { transform: scale(1)   rotate(0deg);  opacity: 1; }
+  }
+
+  /* ── Emoji ── */
+  .emoji {
+    font-size: 100px;
+    line-height: 1;
+    margin-bottom: 12px;
+    display: block;
+    animation: emojiDance 0.8s ease-in-out infinite alternate;
+    filter: drop-shadow(0 0 20px currentColor);
+  }
+  body.lvl1 .emoji { animation: emojiDance 0.8s ease-in-out infinite alternate; }
+  body.lvl2 .emoji { animation: emojiShake 0.3s ease-in-out infinite alternate; }
+  body.lvl3 .emoji { animation: emojiSpin  0.6s linear infinite; }
+
+  @keyframes emojiDance { from { transform: rotate(-10deg) scale(1);   } to { transform: rotate(10deg) scale(1.1); } }
+  @keyframes emojiShake { from { transform: translateX(-8px) scale(1); } to { transform: translateX(8px)  scale(1.05); } }
+  @keyframes emojiSpin  { from { transform: scale(1.1) rotate(0deg);   } to { transform: scale(1.1) rotate(360deg); } }
+
+  /* ── Level badge ── */
+  .badge {
+    display: inline-block;
+    padding: 6px 24px;
+    border-radius: 50px;
+    font-size: 13px;
+    font-weight: 900;
+    letter-spacing: 3px;
+    text-transform: uppercase;
+    margin-bottom: 20px;
+  }
+  body.lvl1 .badge { background: #ffd600; color: #000; }
+  body.lvl2 .badge { background: #ff6d00; color: #fff; animation: pulseOrange 1s ease-in-out infinite; }
+  body.lvl3 .badge { background: #d50000; color: #fff; animation: flashRed 0.5s ease-in-out infinite; }
+
+  @keyframes pulseOrange { 0%,100% { box-shadow: 0 0 0   #ff6d00aa; } 50% { box-shadow: 0 0 20px #ff6d00aa; } }
+  @keyframes flashRed    { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+
+  /* ── Headline ── */
+  h1 {
+    font-size: clamp(36px, 6vw, 64px);
+    font-weight: 900;
+    line-height: 1.1;
+    letter-spacing: -1px;
+    margin-bottom: 16px;
+    animation: headlineIn 0.5s 0.2s both;
+  }
+  body.lvl1 h1 { color: #ffd600; text-shadow: 0 0 30px #ffd600aa; }
+  body.lvl2 h1 { color: #ff8c00; text-shadow: 0 0 30px #ff6d00aa; }
+  body.lvl3 h1 { color: #ff4444; text-shadow: 0 0 30px #d50000aa; animation: headlineIn 0.5s 0.2s both, shake 0.08s 1s infinite; }
+
+  @keyframes headlineIn { from { transform: translateY(-30px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+  @keyframes shake { 0%,100% { transform: translateX(0); } 25% { transform: translateX(-4px); } 75% { transform: translateX(4px); } }
+
+  /* ── Host name ── */
+  .host-chip {
+    display: inline-block;
+    padding: 8px 20px;
+    border-radius: 12px;
+    font-size: 18px;
+    font-weight: 700;
+    margin-bottom: 24px;
+    word-break: break-all;
+  }
+  body.lvl1 .host-chip { background: rgba(255,214,0,0.15); color: #ffd600; border: 1px solid #ffd60055; }
+  body.lvl2 .host-chip { background: rgba(255,109,0,0.15); color: #ff8c00; border: 1px solid #ff6d0055; }
+  body.lvl3 .host-chip { background: rgba(213,0,0,0.15);   color: #ff6666; border: 1px solid #d5000055; }
+
+  /* ── Message ── */
+  .message {
+    font-size: 20px;
+    font-weight: 700;
+    margin-bottom: 12px;
+    line-height: 1.5;
+  }
+  body.lvl1 .message { color: #ffe082; }
+  body.lvl2 .message { color: #ffcc80; }
+  body.lvl3 .message { color: #ef9a9a; }
+
+  .sub-message {
+    font-size: 15px;
+    font-weight: 400;
+    opacity: 0.75;
+    margin-bottom: 36px;
+    color: #ccc;
+  }
+
+  /* ── Warning meter ── */
+  .meter-wrap {
+    margin-bottom: 36px;
+  }
+  .meter-label {
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    color: #aaa;
+    margin-bottom: 10px;
+  }
+  .meter {
+    display: flex;
+    gap: 10px;
+    justify-content: center;
+  }
+  .meter-dot {
+    width: 44px;
+    height: 44px;
+    border-radius: 50%;
+    border: 3px solid;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 18px;
+    font-weight: 900;
+    transition: all 0.4s;
+  }
+  .meter-dot.active-1 { background: #ffd600; border-color: #ffd600; color: #000; box-shadow: 0 0 20px #ffd60088; }
+  .meter-dot.active-2 { background: #ff6d00; border-color: #ff6d00; color: #fff; box-shadow: 0 0 20px #ff6d0088; animation: pulseOrange 0.8s infinite; }
+  .meter-dot.active-3 { background: #d50000; border-color: #d50000; color: #fff; box-shadow: 0 0 20px #d5000088; animation: flashRed 0.4s infinite; }
+  .meter-dot.inactive { background: transparent; border-color: #444; color: #555; }
+
+  /* ── Go back button ── */
+  .btn-back {
+    display: inline-block;
+    padding: 16px 48px;
+    border-radius: 50px;
+    font-size: 18px;
+    font-weight: 900;
+    text-decoration: none;
+    cursor: pointer;
+    border: none;
+    letter-spacing: 1px;
+    transition: transform 0.2s, box-shadow 0.2s;
+  }
+  .btn-back:hover { transform: scale(1.06); }
+  body.lvl1 .btn-back { background: #ffd600; color: #000; box-shadow: 0 8px 32px #ffd60066; }
+  body.lvl2 .btn-back { background: #ff6d00; color: #fff; box-shadow: 0 8px 32px #ff6d0066; }
+  body.lvl3 .btn-back { background: #d50000; color: #fff; box-shadow: 0 8px 32px #d5000066; }
+
+  /* ── Parent notified banner (lvl 3) ── */
+  .notified-banner {
+    display: none;
+    margin-top: 24px;
+    padding: 14px 28px;
+    background: rgba(213,0,0,0.2);
+    border: 2px solid #d50000;
+    border-radius: 14px;
+    font-size: 16px;
+    font-weight: 700;
+    color: #ff8080;
+    animation: fadeSlide 0.6s 0.5s both;
+  }
+  body.lvl3 .notified-banner { display: block; }
+  @keyframes fadeSlide { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
+
+  /* ── Screen flash (lvl 3 only) ── */
+  .flash-overlay {
+    position: fixed;
+    inset: 0;
+    background: #d50000;
+    pointer-events: none;
+    z-index: 999;
+    opacity: 0;
+    animation: screenFlash 0.4s ease-out forwards;
+  }
+  @keyframes screenFlash { 0% { opacity: 0.6; } 100% { opacity: 0; } }
+
+  /* ── Corner lock icons (lvl 3) ── */
+  .corner-lock {
+    position: fixed;
+    font-size: 40px;
+    opacity: 0.15;
+    animation: cornerPulse 2s ease-in-out infinite;
+    pointer-events: none;
+  }
+  @keyframes cornerPulse { 0%,100% { opacity: 0.15; transform: scale(1); } 50% { opacity: 0.4; transform: scale(1.2); } }
+</style>
+</head>
+<body>
+
+<!-- Screen flash for level 3 -->
+<div class="flash-overlay" id="flashOverlay" style="display:none"></div>
+
+<!-- Corner lock icons for level 3 -->
+<span class="corner-lock" id="tl" style="top:20px;left:20px">🔒</span>
+<span class="corner-lock" id="tr" style="top:20px;right:20px;animation-delay:0.5s">🔒</span>
+<span class="corner-lock" id="bl" style="bottom:20px;left:20px;animation-delay:1s">🔒</span>
+<span class="corner-lock" id="br" style="bottom:20px;right:20px;animation-delay:1.5s">🔒</span>
+
+<!-- Particle canvas -->
+<div id="particles"></div>
+
+<div class="card">
+  <span class="emoji" id="emoji"></span>
+  <div class="badge" id="badge"></div>
+  <h1 id="headline"></h1>
+  <div class="host-chip" id="hostChip">🚫 __HOST__</div>
+  <p class="message" id="message"></p>
+  <p class="sub-message" id="subMessage"></p>
+
+  <div class="meter-wrap">
+    <div class="meter-label">Warning Level</div>
+    <div class="meter">
+      <div class="meter-dot" id="dot1"></div>
+      <div class="meter-dot" id="dot2"></div>
+      <div class="meter-dot" id="dot3"></div>
+    </div>
+  </div>
+
+  <button class="btn-back" id="safeBtn" type="button">← Back to Safety</button>
+
+  <div class="notified-banner">
+    🔔 Your guardian has been automatically notified about this attempt.
+  </div>
+</div>
+
+<script>
+  const COUNT = parseInt("__COUNT__") || 1;
+  const HOST  = "__HOST__";
+  const SAFE_URL = __SAFE_URL_JSON__;
+  const LEVEL = Math.min(COUNT, 3);
+  const TRY_NO = Math.min(COUNT, 3);
+  const params = new URLSearchParams(window.location.search || "");
+  const POPUP_MODE = params.get("popup") === "1";
+  const HOLD_SECONDS = Math.max(1, parseInt(params.get("hold") || "20", 10) || 20);
+  const HOLD_MS = HOLD_SECONDS * 1000;
+  const SAFE_LOCAL_URL = "http://127.0.0.1/__guardian_safe";
+
+  // Canonicalize to localhost route to avoid browser retry/fallback flicker
+  // on blocked domains (especially when HTTPS upgrades are attempted).
+  (function stabilizeBlockedPageRoute() {
+    try {
+      const h = (window.location.hostname || "").toLowerCase();
+      const isLocal = h === "127.0.0.1" || h === "localhost" || h === "::1";
+      const isCanonicalPath = (window.location.pathname || "") === "/__guardian_block";
+      if (!isLocal || !isCanonicalPath) {
+        const popupQ = POPUP_MODE ? "&popup=1" : "";
+        const canonical = `http://127.0.0.1/__guardian_block?host=${encodeURIComponent(HOST)}${popupQ}`;
+        window.location.replace(canonical);
+      }
+    } catch (_err) {
+      // Best-effort stabilization only.
+    }
+  })();
+
+  function goToSafety() {
+    const targetUrl = SAFE_LOCAL_URL;
+
+    let opened = false;
+    try {
+      const tab = window.open(targetUrl, "_blank", "noopener,noreferrer");
+      opened = !!tab;
+    } catch (e) {
+      opened = false;
+    }
+
+    if (!opened) {
+      window.location.href = targetUrl;
+      return;
+    }
+
+    setTimeout(() => {
+      try {
+        window.open("", "_self");
+        window.close();
+      } catch (e) {}
+    }, 120);
+
+    setTimeout(() => {
+      try {
+        window.location.replace(targetUrl);
+      } catch (e) {}
+    }, 300);
+  }
+
+  document.getElementById("safeBtn").addEventListener("click", goToSafety);
+
+  // ── Apply level class ────────────────────────────────────────
+  document.body.classList.add(`lvl${LEVEL}`);
+
+  // ── Content per level ────────────────────────────────────────
+  const content = {
+    1: {
+      emoji:    "⚠️",
+      badge:    "⚡ First Warning",
+      headline: "NUH UH! Not Allowed.",
+      message:  `You are not allowed to visit "${HOST}". Try ${TRY_NO}/3.`,
+      sub:      "This popup is one-time for this attempt and closes automatically.",
+    },
+    2: {
+      emoji:    "🚨",
+      badge:    "⚠️ Second Warning",
+      headline: "NUH UH! You Were Warned.",
+      message:  `You tried to revisit "${HOST}". Try ${TRY_NO}/3.`,
+      sub:      "Another attempt will escalate immediately and notify your guardian.",
+    },
+    3: {
+      emoji:    "🔒",
+      badge:    "🚫 Site Blocked — Warning #" + COUNT,
+      headline: "NUH UH! ACCESS DENIED!",
+      message:  `"${HOST}" is completely blocked. Try ${TRY_NO}/3.`,
+      sub:      "You have used all warnings. Your guardian has been notified.",
+    },
+  };
+
+  const c = content[LEVEL];
+  document.getElementById("emoji").textContent      = c.emoji;
+  document.getElementById("badge").textContent      = c.badge;
+  document.getElementById("headline").textContent   = c.headline;
+  document.getElementById("message").textContent    = c.message;
+  document.getElementById("subMessage").textContent = c.sub;
+
+  // ── Warning meter dots ───────────────────────────────────────
+  for (let i = 1; i <= 3; i++) {
+    const dot = document.getElementById(`dot${i}`);
+    if (i <= LEVEL) {
+      dot.classList.add(`active-${Math.min(i, LEVEL)}`);
+      dot.textContent = "!";
+    } else {
+      dot.classList.add("inactive");
+      dot.textContent = i;
+    }
+  }
+
+  // ── Level-3 effects ─────────────────────────────────────────
+  if (LEVEL >= 3) {
+    const flash = document.getElementById("flashOverlay");
+    flash.style.display = "block";
+
+    // Keep corner locks visible only on lvl3
+    document.querySelectorAll(".corner-lock").forEach(el => el.style.opacity = "");
+  } else {
+    document.querySelectorAll(".corner-lock").forEach(el => el.style.display = "none");
+  }
+
+  // ── Floating particles ───────────────────────────────────────
+  const colors = { 1: "#ffd600", 2: "#ff6d00", 3: "#d50000" };
+  const container = document.getElementById("particles");
+  const emojis = { 1: ["⚠️","🚫","❌"], 2: ["🚨","⛔","⚠️"], 3: ["🔒","🚫","❌","🛑"] };
+
+  for (let i = 0; i < 18; i++) {
+    const p = document.createElement("div");
+    p.className = "particle";
+    const useEmoji = Math.random() > 0.5;
+    if (useEmoji) {
+      const elist = emojis[LEVEL];
+      p.textContent = elist[Math.floor(Math.random() * elist.length)];
+      p.style.fontSize = `${14 + Math.random() * 20}px`;
+    } else {
+      p.style.width  = `${6 + Math.random() * 10}px`;
+      p.style.height = p.style.width;
+      p.style.background = colors[LEVEL];
+    }
+    p.style.left             = `${Math.random() * 100}%`;
+    p.style.top              = `${80 + Math.random() * 20}%`;
+    p.style.animationDelay   = `${Math.random() * 3}s`;
+    p.style.animationDuration = `${2 + Math.random() * 3}s`;
+    container.appendChild(p);
+  }
+
+  // ── Level-3: continuous shake on body ───────────────────────
+  if (LEVEL >= 3) {
+    let shakeTimeout;
+    function triggerShake() {
+      document.body.style.transform = `translateX(${Math.random() > 0.5 ? 4 : -4}px)`;
+      setTimeout(() => { document.body.style.transform = ""; }, 80);
+      shakeTimeout = setTimeout(triggerShake, 600 + Math.random() * 800);
+    }
+    setTimeout(triggerShake, 800);
+  }
+
+  (function oneTimePopupFlow() {
+    const targetUrl = SAFE_LOCAL_URL;
+
+    if (POPUP_MODE) {
+      setTimeout(() => {
+        try {
+          const next = window.open(targetUrl, "_blank", "noopener,noreferrer");
+          if (!next) {
+            window.location.replace(targetUrl);
+            return;
+          }
+          window.open("", "_self");
+          window.close();
+        } catch (_e) {}
+      }, HOLD_MS);
+      return;
+    }
+
+    // Keep NUH UH visible, then move same tab to local safe page.
+    setTimeout(() => {
+      try {
+        window.location.replace(targetUrl);
+      } catch (_e) {}
+    }, HOLD_MS);
+  })();
+</script>
+</body>
+</html>

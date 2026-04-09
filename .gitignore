@@ -1,0 +1,25 @@
+# Node dependencies
+**/node_modules/
+
+# Python caches and virtual environments
+**/__pycache__/
+**/*.pyc
+**/.venv/
+**/venv/
+
+# Runtime data and logs
+parent-dashboard/server-ts/data/*.db
+parent-dashboard/server-ts/data/*.db-*
+*.log
+
+# Environment secrets
+parent-dashboard/server-ts/.env
+windows-app/.live-agent-venv/
+
+# Frontend build output
+parent-dashboard/web-ts/dist/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/

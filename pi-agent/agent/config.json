@@ -1,0 +1,15 @@
+{
+    "server_url": "http://192.168.137.1:3000",
+    "device_name": "raspberry-pi-monitored",
+    "screenshot_interval": 5,
+    "screenshot_quality": 60,
+    "auth_token": "",
+    "blocklist_update_interval": 3600,
+    "download_watch_paths": ["/home/pi/Downloads"],
+    "quarantine_path": "/opt/guardian-agent/quarantine",
+    "log_level": "INFO",
+    "stealth_mode": false,
+    "platform": "linux-arm",
+    "use_scrot_fallback": true,
+    "_note": "192.168.137.1 = fixed IP of Windows Mobile Hotspot. Enable hotspot on your Windows PC before starting."
+}

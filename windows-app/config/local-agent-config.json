@@ -1,0 +1,33 @@
+{
+    "server_url":  "http://localhost:3000",
+    "device_name":  "EDGE-LIVE-CONTROLLED",
+    "screenshot_interval":  0.05,
+    "target_fps":  20,
+    "screenshot_quality":  50,
+    "max_width":  1280,
+    "capture_mode":  "screen",
+    "window_title_contains":  "Microsoft Edge",
+    "window_title_excludes":  [
+                                  "Guardian Shield"
+                              ],
+    "auto_launch_edge":  true,
+    "edge_dashboard_url":  "http://localhost:3000",
+    "edge_start_url":  "https://www.youtube.com",
+    "low_latency_mode":  true,
+    "enable_local_buzzer":  true,
+    "enable_block_page_server":  true,
+    "block_page_port":  8080,
+    "use_online_blocklist":  false,
+    "clear_guardian_hosts_on_start":  false,
+    "enable_download_guard":  false,
+    "auth_token":  "",
+    "blocklist_update_interval":  3600,
+    "download_watch_paths":  [
+                                 "C:\\Users\\Aman\\Downloads"
+                             ],
+    "quarantine_path":  "C:\\Users\\Aman\\.guardian-shield\\quarantine",
+    "log_level":  "INFO",
+    "stealth_mode":  false,
+    "platform":  "windows-live",
+    "use_scrot_fallback":  false
+}
