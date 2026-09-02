@@ -13,6 +13,13 @@ const helmet = require("helmet");
 const morgan = require("morgan");
 const path = require("path");
 const db = require("./models/db");
+const {
+  router: appsRouter,
+  runningAppsCache,
+  activeAppCache,
+  activeTimersCache,
+  broadcastBlockedApps,
+} = require("./routes/apps");
 
 // ─── Express Setup ──────────────────────────────────────────────────────────
 
@@ -22,14 +29,44 @@ const server = http.createServer(app);
 const PORT = process.env.PORT || 3000;
 const AGENT_SHARED_SECRET = (process.env.AGENT_SHARED_SECRET || "").trim();
 const AGENT_AUTH_REQUIRED = String(process.env.AGENT_AUTH_REQUIRED || "").toLowerCase() === "true";
+
+// BUG-12: which Socket.IO clients are allowed to receive device data. Screenshots
+// are a child's live screen, so only sockets that prove they are a logged-in parent
+// join the viewer room. Set SOCKET_AUTH_REQUIRED=false only for local debugging.
+const SOCKET_AUTH_REQUIRED =
+  String(process.env.SOCKET_AUTH_REQUIRED || "true").toLowerCase() !== "false";
+
+// Room that receives dashboard-bound broadcasts. Previously these went out via
+// io.emit(), which also sent every frame straight back to the agent that produced
+// it — roughly 4 MB/s of pointless upload on a Pi at 20 fps.
+const VIEWER_ROOM = "dashboard-viewers";
 const SCREENSHOT_PERSIST_INTERVAL_MS = Math.max(
   0,
   parseInt(process.env.SCREENSHOT_PERSIST_INTERVAL_MS || "1000", 10) || 1000
 );
-const DEFAULT_STREAM_TARGET_FPS = Math.max(
-  1,
-  Math.min(30, parseInt(process.env.DEFAULT_STREAM_TARGET_FPS || "20", 10) || 20)
+// Default stream fps, per platform. The Pi captures through sudo+grim, which
+// writes a PNG to disk and re-encodes it every frame, so it cannot sustain the
+// Windows rate. Pushing a flat 20 fps at it queued frames until the socket stalled
+// and the device looked offline. Both values stay overridable from the dashboard's
+// stream settings (the `stream_config` event below).
+function clampFps(value, fallback) {
+  return Math.max(1, Math.min(30, parseInt(value, 10) || fallback));
+}
+
+const DEFAULT_STREAM_TARGET_FPS = clampFps(process.env.DEFAULT_STREAM_TARGET_FPS, 20);
+const DEFAULT_STREAM_TARGET_FPS_LINUX = clampFps(
+  process.env.DEFAULT_STREAM_TARGET_FPS_LINUX,
+  5
 );
+
+/** Pick the connect-time fps for a device based on the platform it reported. */
+function defaultFpsForPlatform(platform) {
+  const p = String(platform || "").toLowerCase();
+  if (p.includes("linux") || p.includes("arm") || p.includes("raspberry")) {
+    return DEFAULT_STREAM_TARGET_FPS_LINUX;
+  }
+  return DEFAULT_STREAM_TARGET_FPS;
+}
 const DEFAULT_STREAM_QUALITY = Math.max(
   20,
   Math.min(90, parseInt(process.env.DEFAULT_STREAM_QUALITY || "50", 10) || 50)
@@ -79,23 +116,156 @@ app.set("deviceTelemetry", deviceTelemetry);
 // Clear stale online flags from previous runs so UI/device targeting starts clean.
 db.prepare("UPDATE devices SET status = 'offline', socket_id = NULL WHERE status = 'online'").run();
 
-// Mark sockets as stale if they stop sending heartbeats/screenshots.
+/** Send a dashboard-bound event to authorized viewers only, never back to agents. */
+function emitToViewers(event, payload) {
+  io.to(VIEWER_ROOM).emit(event, payload);
+}
+
+/**
+ * Refresh a device's liveness from any inbound agent traffic.
+ *
+ * `status` used to be a one-way latch: it was set to 'online' only inside
+ * register_device, so once the 20s sweeper below flipped a device to 'offline' it
+ * stayed offline in the UI until the agent reconnected — even while frames kept
+ * arriving. Any traffic now restores it, and a real transition is broadcast.
+ */
+function touchDeviceOnline(deviceId, deviceName, socketId) {
+  if (!deviceId) return;
+  try {
+    const row = db.prepare("SELECT status, device_name FROM devices WHERE id = ?").get(deviceId);
+    if (!row) return;
+
+    if (row.status === "online") {
+      db.prepare("UPDATE devices SET last_seen = CURRENT_TIMESTAMP WHERE id = ?").run(deviceId);
+      return;
+    }
+
+    db.prepare(
+      `UPDATE devices SET status = 'online', last_seen = CURRENT_TIMESTAMP, socket_id = ?
+       WHERE id = ?`
+    ).run(socketId || null, deviceId);
+
+    console.log(`Device back online: ${deviceName || row.device_name || deviceId}`);
+    emitToViewers("device_status_changed", {
+      device_id: deviceId,
+      device_name: deviceName || row.device_name,
+      status: "online",
+    });
+  } catch (err) {
+    console.error(`Device liveness update error: ${err.message}`);
+  }
+}
+
+// Mark sockets as stale if they stop sending heartbeats/screenshots. The sweeper
+// used to mutate the DB silently, so the dashboard kept showing a device as online
+// (or offline) until the next full /api/devices poll — it now announces each row it
+// actually changes.
 setInterval(() => {
   try {
-    db.prepare(
-      `UPDATE devices
-       SET status = 'offline', socket_id = NULL
-       WHERE status = 'online'
-         AND last_seen IS NOT NULL
-         AND last_seen < datetime('now', '-20 seconds')`
-    ).run();
+    const stale = db
+      .prepare(
+        `SELECT id, device_name FROM devices
+         WHERE status = 'online'
+           AND last_seen IS NOT NULL
+           AND last_seen < datetime('now', '-20 seconds')`
+      )
+      .all();
+    if (!stale.length) return;
+
+    const markOffline = db.prepare(
+      "UPDATE devices SET status = 'offline', socket_id = NULL WHERE id = ?"
+    );
+    for (const dev of stale) {
+      markOffline.run(dev.id);
+      console.log(`Device timed out (no traffic for 20s): ${dev.device_name}`);
+      emitToViewers("device_status_changed", {
+        device_id: dev.id,
+        device_name: dev.device_name,
+        status: "offline",
+      });
+    }
   } catch (err) {
     console.error(`Stale-device cleanup error: ${err.message}`);
   }
 }, 10 * 1000);
 
+// ─── Socket authorization (BUG-12) ─────────────────────────────────────────
+//
+// Every socket used to be anonymous and every dashboard broadcast went to all of
+// them, so anything that could reach port 3000 could watch the child's screen and
+// retune the stream. Sockets are now classified once at handshake time:
+//
+//   * viewer — presented a valid parent JWT; joins VIEWER_ROOM and may send
+//     control events.
+//   * agent  — presented the agent shared secret, or later calls register_device.
+//     Never joins VIEWER_ROOM, so frames are not echoed back at it.
+//   * anonymous — connects (the login page needs this) but receives no device data
+//     and may not send control events.
+//
+// The connection itself is never refused: refusing it would leave the dashboard in
+// a reconnect loop before the parent has had a chance to log in.
+const { verifyToken } = require("./routes/auth");
+
+function classifySocket(socket, authPayload) {
+  const payload = authPayload || {};
+
+  const agentToken = typeof payload.agent_token === "string" ? payload.agent_token.trim() : "";
+  if (AGENT_SHARED_SECRET && agentToken && agentToken === AGENT_SHARED_SECRET) {
+    socket.isAgent = true;
+    return "agent";
+  }
+
+  const user = verifyToken(payload.token);
+  if (user) {
+    socket.isViewer = true;
+    socket.user = { id: user.id, username: user.username, role: user.role };
+    return "viewer";
+  }
+
+  return "anonymous";
+}
+
+io.use((socket, next) => {
+  const kind = classifySocket(socket, socket.handshake.auth);
+  socket.authKind = kind;
+  if (kind === "anonymous" && SOCKET_AUTH_REQUIRED) {
+    console.warn(
+      `Socket ${socket.id} connected without credentials — no device data will be sent`
+    );
+  }
+  next();
+});
+
+/** True when this socket is allowed to receive device data / send control events. */
+function isAuthorizedViewer(socket) {
+  if (socket.isAgent) return false;
+  return socket.isViewer || !SOCKET_AUTH_REQUIRED;
+}
+
 io.on("connection", (socket) => {
-  console.log(`Socket connected: ${socket.id}`);
+  console.log(`Socket connected: ${socket.id} (${socket.authKind})`);
+
+  if (isAuthorizedViewer(socket)) {
+    socket.join(VIEWER_ROOM);
+  }
+
+  /**
+   * Dashboard upgrades an already-open socket after login, so the parent does not
+   * have to reload the page to start receiving frames.
+   */
+  socket.on("dashboard_auth", (data, ack) => {
+    if (socket.isAgent) return;
+    const kind = classifySocket(socket, data);
+    socket.authKind = kind;
+    if (isAuthorizedViewer(socket)) {
+      socket.join(VIEWER_ROOM);
+    } else {
+      socket.leave(VIEWER_ROOM);
+    }
+    if (typeof ack === "function") {
+      ack({ ok: kind === "viewer", authorized: isAuthorizedViewer(socket) });
+    }
+  });
 
   // ── Agent Events ────────────────────────────────────────────────────────
 
@@ -151,6 +321,28 @@ io.on("connection", (socket) => {
     socket.deviceId = deviceId;
     socket.deviceName = safeDeviceName;
 
+    // This socket is an agent, not a dashboard. Take it out of the viewer room so
+    // its own screenshots are not broadcast straight back to it.
+    socket.isAgent = true;
+    socket.isViewer = false;
+    socket.authKind = "agent";
+    socket.leave(VIEWER_ROOM);
+
+    // Push stream settings FIRST. This one is cheap for the agent to apply, and
+    // ordering it ahead of the blocklist means a slow blocklist sweep can no longer
+    // delay the mirror from starting at the right frame rate.
+    const targetFps = defaultFpsForPlatform(safePlatform);
+    socket.emit("update_config", {
+      target_fps: targetFps,
+      screenshot_quality: DEFAULT_STREAM_QUALITY,
+      max_width: DEFAULT_STREAM_MAX_WIDTH,
+      low_latency_mode: true,
+    });
+    console.log(
+      `[stream] ${safeDeviceName} (${safePlatform}) → target_fps=${targetFps}, ` +
+        `quality=${DEFAULT_STREAM_QUALITY}, max_width=${DEFAULT_STREAM_MAX_WIDTH}`
+    );
+
     // Send current custom blocklist to the agent
     const blocklist = db
       .prepare("SELECT domain FROM blocklist")
@@ -158,21 +350,49 @@ io.on("connection", (socket) => {
       .map((r) => r.domain);
     socket.emit("update_blocklist", { domains: blocklist });
 
-    // Push default smooth-stream settings on connect so preview does not stay
-    // at low fallback intervals until manual tuning is applied.
-    socket.emit("update_config", {
-      target_fps: DEFAULT_STREAM_TARGET_FPS,
-      screenshot_quality: DEFAULT_STREAM_QUALITY,
-      max_width: DEFAULT_STREAM_MAX_WIDTH,
-      low_latency_mode: true,
-    });
+    // Request initial application inventory
+    socket.emit("request_installed_apps");
+    socket.emit("request_running_apps");
+
+    // Send blocked applications last: applying it makes the agent walk the whole
+    // process table, so it goes after the cheap events. Still unconditional — an
+    // empty list is how a removed rule gets lifted on a reconnect.
+    const blockedApps = db
+      .prepare(
+        "SELECT process_name FROM blocked_apps WHERE device_id IS NULL OR device_id = ?"
+      )
+      .all(deviceId)
+      .map((r) => r.process_name);
+    socket.emit("update_blocked_apps", { blocked_apps: blockedApps });
 
     // Notify dashboard
-    io.emit("device_status_changed", {
+    emitToViewers("device_status_changed", {
       device_id: deviceId,
       device_name: safeDeviceName,
       status: "online",
     });
+  });
+
+  /**
+   * Agent liveness ping (agent sends one every 5s).
+   *
+   * The server used to infer liveness purely from incoming screenshots, so a slow
+   * capture — grim on a Pi can take seconds — or a capture backend failure looked
+   * exactly like a dead device and tripped the 20s sweeper. That was the "goes
+   * offline every few minutes" report. Heartbeats are independent of capture.
+   */
+  socket.on("heartbeat", (data) => {
+    let devId = socket.deviceId;
+    if (!devId) {
+      const name = socket.deviceName || (data && data.device_name);
+      if (!name) return;
+      const dev = db.prepare("SELECT id FROM devices WHERE device_name = ?").get(name);
+      if (!dev) return;
+      devId = dev.id;
+      socket.deviceId = dev.id;
+      socket.deviceName = name;
+    }
+    touchDeviceOnline(devId, socket.deviceName, socket.id);
   });
 
   /**
@@ -208,12 +428,10 @@ io.on("connection", (socket) => {
       }
     }
 
-    // Update last_seen
+    // Update last_seen (and restore 'online' if the sweeper had flipped it).
     const lastSeen = lastSeenAtByDevice.get(socket.deviceId) || 0;
     if (nowMs - lastSeen >= 1000) {
-      db.prepare(
-        "UPDATE devices SET last_seen = CURRENT_TIMESTAMP WHERE id = ?"
-      ).run(socket.deviceId);
+      touchDeviceOnline(socket.deviceId, socket.deviceName || device_name, socket.id);
       lastSeenAtByDevice.set(socket.deviceId, nowMs);
     }
 
@@ -236,12 +454,15 @@ io.on("connection", (socket) => {
       const lastEmitAt = lastTelemetryEmitAtByDevice.get(socket.deviceId) || 0;
       if (nowMs - lastEmitAt >= 2000) {
         lastTelemetryEmitAtByDevice.set(socket.deviceId, nowMs);
-        io.emit("device_telemetry", telemetry);
+        emitToViewers("device_telemetry", telemetry);
       }
     }
 
-    // Forward to dashboard in real-time
-    io.emit("live_screenshot", {
+    // Forward to dashboard viewers in real-time. Room-scoped, not io.emit: a plain
+    // broadcast also shipped every frame back to the agent that sent it, which on a
+    // Pi at 20 fps meant several MB/s of wasted upload and a socket that eventually
+    // stalled long enough for the server to call the device offline.
+    emitToViewers("live_screenshot", {
       device_id: socket.deviceId,
       device_name,
       image,
@@ -269,7 +490,7 @@ io.on("connection", (socket) => {
     );
 
     // Forward to dashboard in real-time
-    io.emit("new_alert", {
+    emitToViewers("new_alert", {
       device_id: socket.deviceId,
       device_name,
       type,
@@ -280,10 +501,159 @@ io.on("connection", (socket) => {
   });
 
   /**
+   * Agent reports live running applications and foreground app.
+   */
+  socket.on("running_apps_report", (data) => {
+    if (!data) return;
+    let devId = socket.deviceId;
+    if (!devId && (socket.deviceName || data.device_name)) {
+      const dev = db.prepare("SELECT id FROM devices WHERE device_name = ?").get(socket.deviceName || data.device_name);
+      if (dev) {
+        devId = dev.id;
+        socket.deviceId = dev.id;
+      }
+    }
+    if (!devId) return;
+
+    const { active_app, running_apps, active_timers, timestamp } = data;
+
+    if (active_app) {
+      activeAppCache.set(devId, active_app);
+    }
+    if (Array.isArray(running_apps)) {
+      runningAppsCache.set(devId, running_apps);
+    }
+    if (Array.isArray(active_timers)) {
+      activeTimersCache.set(devId, active_timers);
+    }
+
+    // Inbound agent traffic also counts as liveness, so an app sync keeps the
+    // device online even if capture is struggling.
+    touchDeviceOnline(devId, socket.deviceName || data.device_name, socket.id);
+
+    // Broadcast to web dashboard
+    emitToViewers("running_apps_updated", {
+      device_id: devId,
+      device_name: socket.deviceName || data.device_name,
+      active_app,
+      running_apps: running_apps || [],
+      active_timers: active_timers || [],
+      timestamp: timestamp || Date.now(),
+    });
+  });
+
+  /**
+   * Agent reports installed applications.
+   */
+  socket.on("installed_apps_report", (data) => {
+    if (!data || !Array.isArray(data.installed_apps)) return;
+    let devId = socket.deviceId;
+    if (!devId && (socket.deviceName || data.device_name)) {
+      const dev = db.prepare("SELECT id FROM devices WHERE device_name = ?").get(socket.deviceName || data.device_name);
+      if (dev) {
+        devId = dev.id;
+        socket.deviceId = dev.id;
+      }
+    }
+    if (!devId) return;
+
+    const { installed_apps } = data;
+
+    try {
+      const insert = db.prepare(
+        `INSERT INTO device_apps (device_id, app_name, process_name, install_path, category, last_seen)
+         VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+         ON CONFLICT(device_id, app_name) DO UPDATE SET
+           process_name = excluded.process_name,
+           install_path = excluded.install_path,
+           category = excluded.category,
+           last_seen = CURRENT_TIMESTAMP`
+      );
+
+      const tx = db.transaction((apps) => {
+        for (const app of apps) {
+          if (!app.app_name) continue;
+          insert.run(
+            devId,
+            app.app_name,
+            app.process_name || "",
+            app.path || "",
+            app.category || "general"
+          );
+        }
+      });
+      tx(installed_apps);
+      console.log(`[apps] Synced ${installed_apps.length} installed apps for device ${socket.deviceName || devId}`);
+
+      emitToViewers("installed_apps_updated", {
+        device_id: devId,
+        count: installed_apps.length,
+      });
+    } catch (err) {
+      console.error(`[apps] Error persisting installed apps: ${err.message}`);
+    }
+  });
+
+  /**
+   * Agent sends timer update/expiration.
+   */
+  socket.on("app_timer_update", (data) => {
+    if (!socket.deviceId || !data || !data.timer) return;
+    const timer = data.timer;
+    const status = timer.status || "active";
+
+    try {
+      db.prepare(
+        `UPDATE app_timers SET status = ? WHERE device_id = ? AND process_name = ?`
+      ).run(status, socket.deviceId, timer.process_name);
+
+      emitToViewers("app_timer_changed", {
+        device_id: socket.deviceId,
+        timer,
+      });
+    } catch (err) {
+      console.debug(`Timer DB update note: ${err.message}`);
+    }
+  });
+
+  /**
+   * Agent confirms message delivered.
+   */
+  socket.on("child_message_delivered", (data) => {
+    if (!socket.deviceId || !data) return;
+    try {
+      db.prepare(
+        `UPDATE child_messages SET delivered = 1
+         WHERE device_id = ? AND title = ? AND delivered = 0`
+      ).run(socket.deviceId, data.title);
+
+      emitToViewers("child_message_status", {
+        device_id: socket.deviceId,
+        delivered: true,
+        title: data.title,
+      });
+    } catch (err) {
+      console.debug(`Message status DB note: ${err.message}`);
+    }
+  });
+
+  /**
    * Dashboard requests live stream tuning update (FPS/quality/resolution).
    * Forward to a specific device (or all devices if no target provided).
    */
   socket.on("stream_config", (data) => {
+    // BUG-12: retuning the stream is a parent action. An unauthenticated socket
+    // could previously drive every agent's frame rate and quality.
+    if (!isAuthorizedViewer(socket)) {
+      console.warn(`Rejected stream_config from unauthorized socket ${socket.id}`);
+      socket.emit("stream_config_applied", {
+        error: "Unauthorized",
+        delivered: 0,
+        device_id: null,
+      });
+      return;
+    }
+
     const parsedTarget = Number.parseInt(data?.device_id, 10);
     const targetDeviceId = Number.isNaN(parsedTarget) ? null : parsedTarget;
     const cfg = data?.config || {};
@@ -316,21 +686,39 @@ io.on("connection", (socket) => {
   socket.on("disconnect", () => {
     console.log(`Socket disconnected: ${socket.id}`);
 
-    if (socket.deviceId) {
-      db.prepare(
-        "UPDATE devices SET status = 'offline', socket_id = NULL WHERE id = ?"
-      ).run(socket.deviceId);
-      lastPersistAtByDevice.delete(socket.deviceId);
-      lastSeenAtByDevice.delete(socket.deviceId);
-      deviceTelemetry.delete(socket.deviceId);
-      lastTelemetryEmitAtByDevice.delete(socket.deviceId);
+    if (!socket.deviceId) return;
 
-      io.emit("device_status_changed", {
-        device_id: socket.deviceId,
-        device_name: socket.deviceName,
-        status: "offline",
-      });
+    // Only the device's CURRENT socket may mark it offline.
+    //
+    // Reconnects and duplicate agents (two supervisors used to be able to start two
+    // agents under one device_name) overlap: the new socket registers, then the old
+    // one finally times out. Without this guard that stale disconnect flipped a
+    // perfectly live device to 'offline' and wiped its caches — the flap the user saw.
+    const current = db
+      .prepare("SELECT socket_id, device_name FROM devices WHERE id = ?")
+      .get(socket.deviceId);
+
+    if (current && current.socket_id && current.socket_id !== socket.id) {
+      console.log(
+        `Ignoring stale disconnect for ${current.device_name}: ` +
+          `device is live on socket ${current.socket_id}`
+      );
+      return;
     }
+
+    db.prepare(
+      "UPDATE devices SET status = 'offline', socket_id = NULL WHERE id = ? AND (socket_id = ? OR socket_id IS NULL)"
+    ).run(socket.deviceId, socket.id);
+    lastPersistAtByDevice.delete(socket.deviceId);
+    lastSeenAtByDevice.delete(socket.deviceId);
+    deviceTelemetry.delete(socket.deviceId);
+    lastTelemetryEmitAtByDevice.delete(socket.deviceId);
+
+    emitToViewers("device_status_changed", {
+      device_id: socket.deviceId,
+      device_name: socket.deviceName,
+      status: "offline",
+    });
   });
 });
 
@@ -341,6 +729,7 @@ app.use("/api/auth", authRouter);
 app.use("/api/devices", require("./routes/devices"));
 app.use("/api/blocklist", require("./routes/blocklist"));
 app.use("/api/alerts", require("./routes/alerts"));
+app.use("/api/apps", appsRouter);
 
 // Get latest screenshot for a device
 app.get("/api/screenshots/latest/:deviceId", (req, res) => {
@@ -375,15 +764,46 @@ app.get("/api/screenshots/history/:deviceId", (req, res) => {
   res.json(screenshots);
 });
 
-// Health check
+// Health check — BUG-01: now also returns DB screenshot stats
 app.get("/api/health", (req, res) => {
+  const screenshotCount = db
+    .prepare("SELECT COUNT(*) as count FROM screenshots")
+    .get().count;
+  const retentionDays = parseInt(process.env.SCREENSHOT_RETENTION_DAYS || "3", 10);
   res.json({
     status: "ok",
     uptime: process.uptime(),
     devices_online: db
       .prepare("SELECT COUNT(*) as count FROM devices WHERE status = 'online'")
       .get().count,
+    screenshot_count: screenshotCount,
+    screenshot_retention_days: retentionDays,
   });
+});
+
+// BUG-01 FIX: Manual cleanup endpoint — DELETE /api/admin/cleanup?days=N
+// Lets the parent force a DB cleanup without restarting the server.
+const { authMiddleware } = require("./routes/auth");
+app.delete("/api/admin/cleanup", authMiddleware, (req, res) => {
+  const days = Math.max(1, parseInt(req.query.days || "3", 10));
+  try {
+    const before = db.prepare("SELECT COUNT(*) as cnt FROM screenshots").get().cnt;
+    const result = db
+      .prepare(`DELETE FROM screenshots WHERE captured_at < datetime('now', ? || ' days')`)
+      .run(`-${days}`);
+    db.pragma("wal_checkpoint(TRUNCATE)");
+    const after = db.prepare("SELECT COUNT(*) as cnt FROM screenshots").get().cnt;
+    console.log(`[admin/cleanup] Deleted ${result.changes} screenshots older than ${days} days`);
+    res.json({
+      ok: true,
+      deleted: result.changes,
+      remaining: after,
+      days_kept: days,
+    });
+  } catch (err) {
+    console.error(`[admin/cleanup] Error: ${err.message}`);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // SPA fallback — serve dashboard for all non-API routes
@@ -391,7 +811,27 @@ app.get("*", (req, res, next) => {
   if (req.path.startsWith("/socket.io/")) {
     return next();
   }
-  res.sendFile(path.join(__dirname, "..", "web-ts", "dist", "index.html"));
+
+  // BUG-14: an unknown /api/ path used to fall through to index.html, so the
+  // dashboard received HTML where it expected JSON and reported a parse error
+  // instead of a 404. That made a typo'd or missing endpoint look like the whole
+  // page was broken.
+  if (req.path.startsWith("/api/")) {
+    return res.status(404).json({ error: "Not found", path: req.path });
+  }
+
+  const indexPath = path.join(__dirname, "..", "web-ts", "dist", "index.html");
+  res.sendFile(indexPath, (err) => {
+    if (!err) return;
+    console.error(`Dashboard bundle missing at ${indexPath}: ${err.message}`);
+    res
+      .status(503)
+      .type("text/plain")
+      .send(
+        "Guardian Shield dashboard is not built yet.\n\n" +
+          "Run:  cd parent-dashboard/web-ts && npm install && npm run build\n"
+      );
+  });
 });
 
 // ─── Start Server ───────────────────────────────────────────────────────────

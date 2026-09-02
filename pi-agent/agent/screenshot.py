@@ -37,6 +37,11 @@ except ImportError:
 
 logger = logging.getLogger("guardian.screenshot")
 
+# How often the Wayland/grim probe may re-run while no working backend is known.
+# Detection is cheap (a couple of stat() calls) but not free, and the capture loop
+# can ask ~20x/second, so throttle it.
+WAYLAND_REDETECT_SEC = 5.0
+
 
 class ScreenshotCapture:
     """Handles periodic screen capture with JPEG compression.
@@ -88,7 +93,9 @@ class ScreenshotCapture:
             and IMAGEGRAB_AVAILABLE
             and self.capture_mode in ("window", "edge_window")
         )
-        self._wayland_grim_target = self._detect_wayland_grim_target()
+        self._wayland_grim_target = None
+        self._wayland_detect_at = 0.0
+        self._refresh_wayland_target(force=True, quiet=True)
         # On Pi with Xvfb, DISPLAY=:99 is set by start_agent.sh
         if platform.system() == "Linux" and os.environ.get("DISPLAY"):
             self._use_scrot = False  # mss can work if DISPLAY is set
@@ -242,6 +249,57 @@ class ScreenshotCapture:
             self._sct = mss.mss()
         return self._sct
 
+    def _refresh_wayland_target(self, force: bool = False, quiet: bool = False) -> None:
+        """
+        Re-run Wayland detection and adopt the result.
+
+        This used to be a single probe in __init__, and that one-shot cache was why
+        the live view could stay blank forever on a Pi that was otherwise perfectly
+        healthy. Under systemd the agent is started at boot, often *before* the
+        desktop compositor has created /run/user/<uid>/wayland-0. The probe found no
+        socket, cached None, and capture() then skipped the Wayland branch for the
+        rest of the process lifetime — every frame fell through to scrot, which
+        cannot capture a Wayland session. Because the heartbeat is deliberately
+        independent of capture, the dashboard still showed the device online, so the
+        symptom was "device online, mirror never paints", and waiting did not help
+        because nothing ever re-probed.
+
+        Re-detecting also covers the reverse case: the child logs out or the
+        compositor restarts, the old socket path goes stale, and we need to pick up
+        the new one instead of failing on a dead target.
+        """
+        now = time.time()
+        if not force and (now - self._wayland_detect_at) < WAYLAND_REDETECT_SEC:
+            return
+        self._wayland_detect_at = now
+
+        try:
+            target = self._detect_wayland_grim_target()
+        except Exception as e:
+            logger.debug(f"Wayland capture detection failed: {e}")
+            return
+
+        if target == self._wayland_grim_target:
+            return
+
+        previous = self._wayland_grim_target
+        self._wayland_grim_target = target
+        if quiet:
+            return
+
+        if target:
+            logger.info(
+                "Wayland capture target acquired via grim "
+                f"(run_as={target.get('user') or 'current-user'}, "
+                f"display={target.get('display')})"
+            )
+        elif previous:
+            logger.warning(
+                "Wayland capture target disappeared "
+                f"(was {previous.get('runtime_dir')}/{previous.get('display')}); "
+                "will keep probing"
+            )
+
     def _detect_wayland_grim_target(self):
         """Find a Wayland runtime/display pair usable by grim."""
         if platform.system() != "Linux":
@@ -369,35 +427,59 @@ class ScreenshotCapture:
 
     def _capture_with_scrot(self) -> Optional[bytes]:
         """Capture using scrot command-line tool (Linux fallback)."""
+        tmp_path = None
         try:
             with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
                 tmp_path = tmp.name
             
+            # Remove the 0-byte placeholder so scrot creates a fresh image
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
             env = os.environ.copy()
+            if not env.get("DISPLAY") and os.path.exists("/tmp/.X11-unix/X0"):
+                env["DISPLAY"] = ":0"
+            if not env.get("XAUTHORITY") and os.path.exists("/home/pi/.Xauthority"):
+                env["XAUTHORITY"] = "/home/pi/.Xauthority"
+
             result = subprocess.run(
-                ["scrot", "--silent", tmp_path],
+                ["scrot", "--overwrite", tmp_path],
                 env=env,
-                timeout=10,
+                timeout=5,
                 capture_output=True
             )
             
-            if result.returncode != 0:
-                logger.error(f"scrot failed: {result.stderr.decode()}")
+            if result.returncode != 0 or not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
+                err = (result.stderr or b"").decode(errors="ignore").strip()
+                if err:
+                    logger.debug(f"scrot failed: {err}")
                 return None
             
             img = Image.open(tmp_path).convert("RGB")
-            os.unlink(tmp_path)
+            try:
+                os.unlink(tmp_path)
+                tmp_path = None
+            except Exception:
+                pass
 
             jpeg_bytes = self._encode_image(img)
             logger.debug(f"scrot capture: {img.width}x{img.height}, {len(jpeg_bytes)/1024:.1f} KB")
             return jpeg_bytes
 
         except FileNotFoundError:
-            logger.error("scrot not installed. Run: sudo apt install scrot")
+            logger.debug("scrot not installed.")
             return None
         except Exception as e:
-            logger.error(f"scrot capture failed: {e}")
+            logger.debug(f"scrot capture failed: {e}")
             return None
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
 
     def _capture_with_mss(self) -> Optional[bytes]:
         """Capture using mss library."""
@@ -437,10 +519,19 @@ class ScreenshotCapture:
             if window_bytes:
                 return window_bytes
 
+        # Re-probe while we have no Wayland target: the compositor may simply not
+        # have been up yet when the service started. Throttled internally.
+        if not self._wayland_grim_target:
+            self._refresh_wayland_target()
+
         if self._wayland_grim_target:
             grim_bytes = self._capture_with_grim()
             if grim_bytes:
                 return grim_bytes
+            # grim was available but produced nothing — the session may have been
+            # replaced. Re-probe so a new socket is picked up instead of retrying a
+            # dead one until the process restarts.
+            self._refresh_wayland_target()
 
         if self._use_scrot:
             return self._capture_with_scrot()

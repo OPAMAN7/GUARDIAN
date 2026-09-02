@@ -11,10 +11,10 @@ Run this instead of `node index.js` directly.
 Usage: python watchdog_server.py
 """
 
+import functools
 import http.server
 import json
 import logging
-import os
 import platform
 import socket
 import subprocess
@@ -66,13 +66,18 @@ class _FileHandler(http.server.SimpleHTTPRequestHandler):
 
 
 def _serve_file(directory: Path, port: int, duration: int):
-    os.chdir(str(directory))
-    srv = http.server.HTTPServer(("localhost", port), _FileHandler)
+    # BUG-05: os.chdir() mutates process-wide state from a worker thread, which
+    # broke every other relative path in the watchdog. Bind the directory to
+    # the handler instead so the serving root is thread-local.
+    handler = functools.partial(_FileHandler, directory=str(directory))
+    srv = http.server.HTTPServer(("localhost", port), handler)
     srv.timeout = 1
     deadline = time.time() + duration
-    while time.time() < deadline:
-        srv.handle_request()
-    srv.server_close()
+    try:
+        while time.time() < deadline:
+            srv.handle_request()
+    finally:
+        srv.server_close()
 
 
 def _show_nuh_uh():

@@ -19,7 +19,6 @@ import threading
 import subprocess
 import ctypes
 import shutil
-import queue
 import psutil
 from pathlib import Path
 from typing import Optional
@@ -38,6 +37,7 @@ from guardian_watchdog import (
 )
 from block_page_server import start_block_server
 from buzzer import play_warning
+from app_tracker import AppTracker
 
 # ─── Logging Setup ────────────────────────────────────────────────────────────
 
@@ -56,6 +56,17 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger("guardian.main")
+
+# ─── Liveness tuning ──────────────────────────────────────────────────────────
+
+# How often the agent emits a standalone heartbeat. Must be comfortably below the
+# server's stale-device threshold (20s) so a slow or failed screen capture can no
+# longer make the device look offline.
+HEARTBEAT_INTERVAL_SEC = 5.0
+
+# If the server never acknowledges an in-flight frame within this window, stop
+# waiting for the ack and send the next frame anyway.
+SEND_ACK_TIMEOUT_SEC = 2.5
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -133,6 +144,10 @@ class ServerConnection:
         self.auth_token = auth_token
         self.low_latency_mode = bool(low_latency_mode)
         self._send_inflight = False
+        # Wall-clock time the in-flight frame was emitted. Used to break the latch
+        # if the server never acks — otherwise one lost ack freezes the stream
+        # permanently (which looked exactly like a static mirror image).
+        self._send_inflight_at = 0.0
         self._dropped_frames = 0
         self.sio = socketio.Client(
             reconnection=True,
@@ -145,6 +160,27 @@ class ServerConnection:
         self._on_config_update = None
         self._on_blocklist_update = None
         self._setup_events()
+
+    def _run_off_read_loop(self, label: str, fn, *args, **kwargs):
+        """
+        Run a socket handler's real work on a background thread.
+
+        python-socketio's Client dispatches event handlers inline on its read-loop
+        thread. Anything slow or blocking there stops the client answering engine.io
+        PINGs, so the server drops the connection after pingTimeout and the device
+        flaps offline. Every handler that touches the app tracker, the blocker or
+        the registry goes through here.
+        """
+        def _worker():
+            try:
+                fn(*args, **kwargs)
+            except Exception as e:
+                logger.error(f"{label} handler failed: {e}")
+
+        try:
+            self.sio.start_background_task(_worker)
+        except Exception as e:
+            logger.error(f"Could not dispatch {label} to a worker thread: {e}")
 
     def _setup_events(self):
         @self.sio.event
@@ -173,21 +209,27 @@ class ServerConnection:
         # Handle commands from the dashboard
         @self.sio.on("update_blocklist")
         def on_update_blocklist(data):
-            logger.info(f"Received blocklist update: {len(data.get('domains', []))} domains")
-            ok = True
-            if hasattr(self, '_blocker') and self._blocker:
-                ok = self._blocker.set_custom_domains(data.get("domains", []))
-                if ok is False:
-                    self.send_alert(
-                        alert_type="blocking_error",
-                        message="Blocked sites could not be applied (run agent as Administrator)",
-                        details={"reason": "hosts_write_failed"},
-                    )
-            if callable(self._on_blocklist_update):
-                try:
-                    self._on_blocklist_update(data.get("domains", []), ok)
-                except Exception as e:
-                    logger.error(f"Blocklist enforcement callback failed: {e}")
+            domains = data.get("domains", []) or []
+            logger.info(f"Received blocklist update: {len(domains)} domains")
+
+            def _apply():
+                ok = True
+                if hasattr(self, '_blocker') and self._blocker:
+                    ok = self._blocker.set_custom_domains(domains)
+                    if ok is False:
+                        self.send_alert(
+                            alert_type="blocking_error",
+                            message="Blocked sites could not be applied (run agent as Administrator)",
+                            details={"reason": "hosts_write_failed"},
+                        )
+                if callable(self._on_blocklist_update):
+                    try:
+                        self._on_blocklist_update(domains, ok)
+                    except Exception as e:
+                        logger.error(f"Blocklist enforcement callback failed: {e}")
+
+            # Writes the hosts file and may flush DNS — far too slow for the read loop.
+            self._run_off_read_loop("update_blocklist", _apply)
 
         @self.sio.on("update_config")
         def on_update_config(data):
@@ -197,6 +239,118 @@ class ServerConnection:
                     self._on_config_update(data)
                 except Exception as e:
                     logger.error(f"Failed to apply remote config: {e}")
+
+        # ── App Tracking & Remote Control Commands ──────────────────────────
+        @self.sio.on("close_app")
+        def on_close_app(data):
+            logger.info(f"Received remote close_app command: {data}")
+            pid = data.get("pid")
+            process_name = data.get("process_name")
+            if hasattr(self, "_app_tracker") and self._app_tracker:
+                def _close():
+                    ok = self._app_tracker.close_app(pid=pid, process_name=process_name)
+                    logger.info(f"close_app result for {process_name or pid}: {ok}")
+
+                self._run_off_read_loop("close_app", _close)
+
+        @self.sio.on("set_app_timer")
+        def on_set_app_timer(data):
+            logger.info(f"Received remote set_app_timer: {data}")
+            app_name = data.get("app_name") or ""
+            process_name = data.get("process_name") or ""
+            duration = int(data.get("duration_seconds") or 300)
+            timer_id = data.get("timer_id")
+            if hasattr(self, "_app_tracker") and self._app_tracker:
+                self._run_off_read_loop(
+                    "set_app_timer",
+                    self._app_tracker.set_app_timer,
+                    app_name=app_name,
+                    process_name=process_name,
+                    duration_seconds=duration,
+                    timer_id=timer_id,
+                )
+
+        @self.sio.on("cancel_app_timer")
+        def on_cancel_app_timer(data):
+            logger.info(f"Received cancel_app_timer: {data}")
+            timer_id_or_process = data.get("timer_id") or data.get("process_name")
+            if hasattr(self, "_app_tracker") and self._app_tracker:
+                self._run_off_read_loop(
+                    "cancel_app_timer",
+                    self._app_tracker.cancel_app_timer,
+                    timer_id_or_process,
+                )
+
+        @self.sio.on("update_blocked_apps")
+        def on_update_blocked_apps(data):
+            apps = data.get("blocked_apps") or []
+            logger.info(f"Received update_blocked_apps: {len(apps)} items")
+            if hasattr(self, "_app_tracker") and self._app_tracker:
+                # Scans and kills processes — never run this on the read loop.
+                self._run_off_read_loop(
+                    "update_blocked_apps", self._app_tracker.set_blocked_apps, apps
+                )
+
+        @self.sio.on("send_child_message")
+        def on_send_child_message(data):
+            logger.info(f"Received parent message for child: {data.get('title')}")
+            title = data.get("title") or "Notice"
+            message = data.get("message") or ""
+            urgency = data.get("urgency") or "info"
+            duration = int(data.get("duration") or 10)
+            if hasattr(self, "_app_tracker") and self._app_tracker:
+                def _show():
+                    self._app_tracker.show_child_message(
+                        title=title,
+                        message=message,
+                        urgency=urgency,
+                        duration=duration,
+                    )
+                    self.sio.emit("child_message_delivered", {
+                        "device_name": self.device_name,
+                        "title": title,
+                        "delivered_at": time.time(),
+                    })
+
+                # Spawns a Tkinter/notify-send popup — keep it off the read loop.
+                self._run_off_read_loop("send_child_message", _show)
+
+        @self.sio.on("request_running_apps")
+        def on_request_running_apps(data=None):
+            logger.info("Received request_running_apps from server")
+            if hasattr(self, "_app_tracker") and self._app_tracker:
+                def _report():
+                    apps = self._app_tracker.get_running_apps(limit=50)
+                    active = self._app_tracker.get_foreground_app()
+                    timers = self._app_tracker.get_active_timers()
+                    logger.info(f"Emitting running_apps_report ({len(apps)} running apps, active: {active.get('app_name')})")
+                    self.sio.emit("running_apps_report", {
+                        "device_name": self.device_name,
+                        "active_app": active,
+                        "running_apps": apps,
+                        "active_timers": timers,
+                        "timestamp": time.time(),
+                    })
+
+                self._run_off_read_loop("request_running_apps", _report)
+
+        @self.sio.on("request_installed_apps")
+        def on_request_installed_apps(data=None):
+            logger.info("Received request_installed_apps from server")
+            if hasattr(self, "_app_tracker") and self._app_tracker:
+                force = bool(data.get("force") if isinstance(data, dict) else False)
+
+                def _report():
+                    installed = self._app_tracker.get_installed_apps(force_refresh=force)
+                    logger.info(f"Emitting installed_apps_report ({len(installed)} apps discovered)")
+                    self.sio.emit("installed_apps_report", {
+                        "device_name": self.device_name,
+                        "installed_apps": installed,
+                        "timestamp": time.time(),
+                    })
+
+                # Registry triple-scan on Windows / .desktop walk on Linux — seconds.
+                self._run_off_read_loop("request_installed_apps", _report)
 
     def connect(self):
         """Connect to the server (non-blocking)."""
@@ -227,11 +381,19 @@ class ServerConnection:
             return False
 
         if self.low_latency_mode and self._send_inflight:
-            # Drop stale frames under load to keep live output current.
-            self._dropped_frames += 1
-            if self._dropped_frames % 120 == 0:
-                logger.info(f"Dropped {self._dropped_frames} stale frames (low-latency mode)")
-            return True
+            # Break a stuck latch: if the ack never arrived, stop waiting for it.
+            if time.time() - self._send_inflight_at >= SEND_ACK_TIMEOUT_SEC:
+                logger.warning(
+                    f"No screenshot ack in {SEND_ACK_TIMEOUT_SEC:.1f}s — "
+                    f"clearing in-flight latch and resuming the stream"
+                )
+                self._send_inflight = False
+            else:
+                # Drop stale frames under load to keep live output current.
+                self._dropped_frames += 1
+                if self._dropped_frames % 120 == 0:
+                    logger.info(f"Dropped {self._dropped_frames} stale frames (low-latency mode)")
+                return True
 
         try:
             # Encode as base64 for Socket.IO transport
@@ -247,6 +409,7 @@ class ServerConnection:
 
             if self.low_latency_mode:
                 self._send_inflight = True
+                self._send_inflight_at = time.time()
 
                 def _acked(*_):
                     self._send_inflight = False
@@ -258,6 +421,24 @@ class ServerConnection:
         except Exception as e:
             self._send_inflight = False
             logger.error(f"Failed to send screenshot: {e}")
+            return False
+
+    def send_heartbeat(self) -> bool:
+        """
+        Emit a tiny liveness ping. Deliberately independent of screen capture:
+        previously the only thing that refreshed the server's `last_seen` was the
+        screenshot event, so any capture stall made the device look offline.
+        """
+        if not self._connected:
+            return False
+        try:
+            self.sio.emit("heartbeat", {
+                "device_name": self.device_name,
+                "timestamp": time.time(),
+            })
+            return True
+        except Exception as e:
+            logger.debug(f"Heartbeat emit failed: {e}")
             return False
 
     def send_alert(self, alert_type: str, message: str, details: dict = None):
@@ -355,7 +536,15 @@ class GuardianAgent:
             psutil.cpu_percent(interval=None)
         except Exception:
             pass
-        # Let server connection access blocker for remote commands
+
+        # Initialize Application Tracker
+        self.app_tracker = AppTracker(
+            on_alert=self._on_app_alert,
+            on_timer_status=self._on_app_timer_status,
+            enable_buzzer=self.enable_local_buzzer,
+        )
+        # Link to server connection
+        self.server._app_tracker = self.app_tracker
         self.server._blocker = self.blocker
         self.server._on_config_update = self._apply_remote_config
         self.server._on_blocklist_update = self._on_blocklist_update
@@ -400,6 +589,29 @@ class GuardianAgent:
                 f"max_width={self.config.get('max_width', 1920)}, "
                 f"low_latency={self.config.get('low_latency_mode', False)}"
             )
+
+    def _on_app_alert(self, alert_type: str, message: str, details: dict):
+        """Callback from app_tracker when an app is blocked, closed, or timer expires."""
+        logger.warning(f"App Tracker Alert: [{alert_type}] {message}")
+        if self.enable_local_buzzer and alert_type in ("app_blocked", "app_timer_expired"):
+            play_warning(2)
+        self.server.send_alert(
+            alert_type=alert_type,
+            message=message,
+            details=details or {},
+        )
+
+    def _on_app_timer_status(self, timer_data: dict):
+        """Forward timer updates to server."""
+        if self.server and self.server.connected:
+            try:
+                self.server.sio.emit("app_timer_update", {
+                    "device_name": self.server.device_name,
+                    "timer": timer_data,
+                    "timestamp": time.time(),
+                })
+            except Exception as e:
+                logger.debug(f"Timer status emit error: {e}")
 
     def _on_threat_detected(self, filepath: str, threat_name: str):
         """Callback when malware is detected in a download."""
@@ -523,6 +735,8 @@ class GuardianAgent:
             "cpu_usage_pct": None,
             "cpu_temp_c": None,
             "memory_usage_pct": None,
+            "active_app": None,
+            "active_timers": [],
         }
 
         try:
@@ -538,6 +752,13 @@ class GuardianAgent:
         temp = self._read_cpu_temp_c()
         if temp is not None:
             data["cpu_temp_c"] = temp
+
+        try:
+            if hasattr(self, "app_tracker") and self.app_tracker:
+                data["active_app"] = self.app_tracker.get_foreground_app()
+                data["active_timers"] = self.app_tracker.get_active_timers()
+        except Exception as e:
+            logger.debug(f"Telemetry active app collection note: {e}")
 
         return data
 
@@ -959,7 +1180,17 @@ class GuardianAgent:
         else:
             logger.info("Download guard disabled by config")
 
-        # 4. Start screenshot loop (blocking — runs forever)
+        # 5. Start Application Tracker & periodic reporting
+        logger.info("Starting application tracker...")
+        self.app_tracker.start()
+        threading.Thread(target=self._app_sync_loop, daemon=True, name="app-sync-loop").start()
+
+        # 5b. Start the liveness heartbeat. Deliberately its own thread with no
+        # dependency on capture, the app tracker or the blocker, so nothing slow
+        # can make the device look offline.
+        threading.Thread(target=self._heartbeat_loop, daemon=True, name="heartbeat").start()
+
+        # 6. Start screenshot loop (blocking — runs forever)
         logger.info("Starting screenshot capture...")
         target_fps = float(self.config.get("target_fps", 0) or 0)
         if target_fps > 0:
@@ -969,11 +1200,38 @@ class GuardianAgent:
         logger.info(f"Capture interval: {interval:.3f}s (~{1.0 / interval:.1f} FPS)")
 
         try:
+            consecutive_capture_failures = 0
             while self._running:
                 start_time = time.time()
-                jpeg = self.screenshotter.capture()
+                try:
+                    jpeg = self.screenshotter.capture()
+                except Exception as cap_err:
+                    jpeg = None
+                    logger.error(f"Screen capture raised: {cap_err}")
+
                 if jpeg:
-                    self._screenshot_callback(jpeg, time.time())
+                    if consecutive_capture_failures:
+                        logger.info(
+                            f"Screen capture recovered after "
+                            f"{consecutive_capture_failures} failed attempt(s)"
+                        )
+                        consecutive_capture_failures = 0
+                    try:
+                        self._screenshot_callback(jpeg, time.time())
+                    except Exception as send_err:
+                        # Never let a send/telemetry error kill the capture loop —
+                        # that used to leave the mirror frozen on the last frame.
+                        logger.error(f"Screenshot dispatch failed: {send_err}")
+                else:
+                    consecutive_capture_failures += 1
+                    # Log on the 1st, 5th, then every 20th failure so a broken
+                    # capture backend is visible in the journal instead of silent.
+                    if consecutive_capture_failures in (1, 5) or consecutive_capture_failures % 20 == 0:
+                        logger.warning(
+                            f"Screen capture returned no frame "
+                            f"({consecutive_capture_failures} consecutive). "
+                            f"Live view will stay on the last good frame."
+                        )
                 elapsed = time.time() - start_time
 
                 # Recompute interval dynamically so dashboard tuning applies live.
@@ -991,11 +1249,65 @@ class GuardianAgent:
         finally:
             self.stop()
 
+    def _heartbeat_loop(self):
+        """
+        Emit a small heartbeat every HEARTBEAT_INTERVAL_SEC.
+
+        This exists because the server used to infer liveness purely from incoming
+        screenshots, so a slow capture (grim can take seconds on a Pi) or a capture
+        failure looked identical to a dead device and tripped the 20s stale sweeper.
+        """
+        while self._running:
+            try:
+                if self.server:
+                    self.server.send_heartbeat()
+            except Exception as e:
+                logger.debug(f"Heartbeat tick note: {e}")
+            time.sleep(HEARTBEAT_INTERVAL_SEC)
+
+    def _app_sync_loop(self):
+        """Periodically report running apps and initial installed apps to the server."""
+        time.sleep(2.0)  # Wait for socket connection to stabilize
+        last_installed_sync = 0.0
+
+        while self._running:
+            try:
+                if self.server and (self.server.connected or (hasattr(self.server, "sio") and self.server.sio.connected)):
+                    now = time.time()
+                    # 1. Sync installed apps once on startup & every 10 minutes
+                    if now - last_installed_sync >= 600.0:
+                        last_installed_sync = now
+                        installed = self.app_tracker.get_installed_apps()
+                        logger.info(f"Syncing {len(installed)} installed apps to server")
+                        self.server.sio.emit("installed_apps_report", {
+                            "device_name": self.server.device_name,
+                            "installed_apps": installed,
+                            "timestamp": now,
+                        })
+
+                    # 2. Sync running apps every 3.5 seconds
+                    running = self.app_tracker.get_running_apps(limit=40)
+                    active = self.app_tracker.get_foreground_app()
+                    timers = self.app_tracker.get_active_timers()
+                    self.server.sio.emit("running_apps_report", {
+                        "device_name": self.server.device_name,
+                        "active_app": active,
+                        "running_apps": running,
+                        "active_timers": timers,
+                        "timestamp": now,
+                    })
+            except Exception as e:
+                logger.debug(f"App sync loop tick note: {e}")
+
+            time.sleep(3.5)
+
     def stop(self):
         """Stop all agent modules gracefully."""
         self._running = False
         logger.info("Stopping Guardian Shield Agent...")
 
+        if hasattr(self, "app_tracker") and self.app_tracker:
+            self.app_tracker.stop()
         self.cache_uploader.stop()
         if self.use_online_blocklist:
             self.blocklist_updater.stop()

@@ -119,7 +119,12 @@ fi
 
 cd /opt/guardian-agent
 source venv/bin/activate
-python3 main.py
+# --no-watchdog is deliberate: systemd (Restart=always) is the single supervisor.
+# Without this flag main.py spawns its own detached watchdog, which restarts the
+# agent independently of systemd. Both then bring an agent up under the same
+# device_name, and when the stale socket disconnects the server marks the live
+# device offline — that was the "goes offline every few minutes" flap.
+python3 main.py --no-watchdog
 
 if [ -n "$XVFB_PID" ]; then
     kill $XVFB_PID 2>/dev/null || true

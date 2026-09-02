@@ -26,9 +26,15 @@ Description={SERVICE_DESC}
 After=network.target graphical.target
 Wants=graphical.target
 
+# NOTE: ExecStart passes --no-watchdog on purpose. Without it the agent spawns its
+# own watchdog subprocess on top of {SERVICE_NAME}-watchdog.service, giving two
+# watchdogs racing over the same PID file. That can leave two agents alive under one
+# device_name, and when the stale socket disconnects the server marks the live device
+# offline — the "goes offline every few minutes" flap.
+
 [Service]
 Type=simple
-ExecStart={{python_path}} {{agent_path}}
+ExecStart={{python_path}} {{agent_path}} --no-watchdog
 Restart=always
 RestartSec=3
 User=root
@@ -201,7 +207,12 @@ def install_linux_service():
     agent_dir = Path(__file__).parent
     python_path = sys.executable
     agent_path = agent_dir / "main.py"
-    watchdog_path = agent_dir / "watchdog.py"
+    # BUG-04: the watchdog module is guardian_watchdog.py — "watchdog.py" does
+    # not exist here and would also shadow the pip `watchdog` package.
+    watchdog_path = agent_dir / "guardian_watchdog.py"
+    if not watchdog_path.exists():
+        logger.error(f"Watchdog script not found: {watchdog_path}")
+        return False
 
     # Write main agent service
     unit_content = SYSTEMD_UNIT.format(

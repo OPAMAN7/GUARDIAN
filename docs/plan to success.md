@@ -1,5 +1,13 @@
 # PLAN TO SUCCESS (MASTER RUNBOOK)
 
+> ⚠️ **HISTORICAL — hotspot era. Do not follow the commands below verbatim.**
+> This runbook was written when the Pi joined a Windows hotspot on `192.168.137.x`,
+> and every `192.168.137.1` in it is a stale hardcoded address. The live setup is a
+> normal LAN and the addresses live only in `windows-app/config/guard_runtime.json`.
+> For anything operational — deploying, restarting, or diagnosing the Pi — use
+> `GUARD.bat` (`deploy` / `diag` / `ip`) and read `docs/MASTER_AI.md` +
+> `docs/SESSION_MEMORY.md`. Keep this file for the branding/GUI plan only.
+
 This is the only planning/operation guide.
 All other planning docs were removed.
 

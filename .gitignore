@@ -8,16 +8,43 @@
 **/venv/
 
 # Runtime data and logs
-parent-dashboard/server-ts/data/*.db
-parent-dashboard/server-ts/data/*.db-*
+parent-dashboard/server-ts/data/
+**/*.db
+**/*.db-*
+**/*.sqlite
+**/*.sqlite-*
 *.log
+*.log.*
+pi-agent/agent/warning_counts.json
+windows-app/watchdog/kill_attempts.txt
+
+# Local machine and deployment configuration
+windows-app/config/guard_runtime.json
+windows-app/config/local-agent-config*.json
+pi-agent/agent/config.json
+**/.guardian-shield/
+
+# Certificates, private keys, and other local credentials
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+**/*credentials*
+**/*secrets*
 
 # Environment secrets
 parent-dashboard/server-ts/.env
 windows-app/.live-agent-venv/
 
 # Frontend build output
-parent-dashboard/web-ts/dist/
+**/dist/
+**/build/
+
+# Local test captures and generated artifacts
+/guardian_wayland_test.png
+/latest_aman_test.jpg
+**/screenshots/
+**/captures/
 
 # OS/editor files
 .DS_Store

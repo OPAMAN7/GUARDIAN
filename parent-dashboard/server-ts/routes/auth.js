@@ -184,4 +184,21 @@ function authMiddleware(req, res, next) {
   }
 }
 
-module.exports = { router, authMiddleware };
+/**
+ * BUG-12: verify a JWT presented over a Socket.IO handshake (or a later
+ * `dashboard_auth` event). Returns the decoded payload, or null when the token is
+ * missing/invalid/expired. Lives here so the JWT secret — including the dev
+ * fallback — is resolved in exactly one place.
+ */
+function verifyToken(rawToken) {
+  const token =
+    typeof rawToken === "string" ? rawToken.replace(/^Bearer\s+/i, "").trim() : "";
+  if (!token) return null;
+  try {
+    return jwt.verify(token, EFFECTIVE_JWT_SECRET);
+  } catch (err) {
+    return null;
+  }
+}
+
+module.exports = { router, authMiddleware, verifyToken };

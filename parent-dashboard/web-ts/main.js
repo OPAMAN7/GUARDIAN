@@ -43,6 +43,9 @@ const state = {
   streamTimer: null,
   pendingLiveFrame: null,
   frameRenderToken: 0,
+  // Highest frame token actually painted. Used to decide whether a decode that
+  // just finished is still newer than what is on screen.
+  lastAppliedFrameToken: 0,
   streamConfig: {
     target_fps: 20,
     screenshot_quality: 50,
@@ -61,6 +64,18 @@ const state = {
   deviceTelemetry: {},
   telemetryPollTimer: null,
   lastTelemetryUiRenderAt: 0,
+  appsData: {
+    activeApp: null,
+    runningApps: [],
+    installedApps: [],
+    blockedApps: [],
+    activeTimers: [],
+    messages: [],
+    selectedTab: "running",
+    runningSearch: "",
+    installedSearch: "",
+    installedCategory: "all",
+  },
 };
 
 // ─── API Helper ─────────────────────────────────────────────────────────────
@@ -293,6 +308,18 @@ function openOutputControllerWindow() {
   );
 }
 
+// A Raspberry Pi captures through grim/scrot, which writes a PNG to disk and
+// re-encodes it for every single frame. It cannot sustain the Windows rate, and
+// pushing 20 fps at it just queues frames until the socket stalls. Automatic
+// pushes are therefore capped; an explicit Apply from the stream settings panel
+// still wins, so this stays overridable.
+const LOW_POWER_AUTO_FPS = 5;
+
+function isLowPowerDevice(device) {
+  const p = String(device?.platform || "").toLowerCase();
+  return p.includes("linux") || p.includes("arm") || p.includes("raspberry");
+}
+
 function pushStreamConfig(silent = false) {
   if (!state.socket || !state.socket.connected) {
     if (!silent) showToast("Not connected to server", "warning");
@@ -309,10 +336,15 @@ function pushStreamConfig(silent = false) {
     return;
   }
 
-  state.streamTargetFps = state.streamConfig.target_fps;
+  const config = { ...state.streamConfig };
+  if (silent && isLowPowerDevice(selected)) {
+    config.target_fps = Math.min(config.target_fps, LOW_POWER_AUTO_FPS);
+  }
+
+  state.streamTargetFps = config.target_fps;
   state.socket.emit("stream_config", {
     device_id: state.selectedDeviceId,
-    config: state.streamConfig,
+    config,
   });
 }
 
@@ -321,10 +353,19 @@ function pushStreamConfig(silent = false) {
 function initSocket() {
   if (state.socket) state.socket.disconnect();
 
-  state.socket = io({ transports: ["websocket", "polling"] });
+  // BUG-12: the server only forwards device data (screenshots, telemetry, app
+  // reports) to sockets that present a valid parent token, so send it with the
+  // handshake. initSocket() only runs once state.token exists.
+  state.socket = io({
+    transports: ["websocket", "polling"],
+    auth: { token: state.token },
+  });
 
   state.socket.on("connect", () => {
     state.connected = true;
+    // Re-assert credentials on every (re)connect: after a token refresh the
+    // handshake payload can be stale.
+    state.socket.emit("dashboard_auth", { token: state.token });
     updateConnectionStatus();
   });
 
@@ -393,8 +434,49 @@ function initSocket() {
     if (!data) return;
     if ((data.delivered || 0) > 0) {
       showToast(`Stream settings applied to ${data.delivered} device(s)`, "success");
+    } else if (data.error === "Unauthorized") {
+      // Not a device problem: this socket is not a recognised viewer, so the server
+      // also will not send it live_screenshot frames. Almost always a stale
+      // web-ts/dist bundle that predates the socket auth handshake (BUG-29) — or a
+      // session whose token expired.
+      showToast("This dashboard is not authorized for live streaming — rebuild the UI " +
+                "(GUARD.bat build) or log in again", "error");
     } else {
       showToast("No target device received stream settings", "warning");
+    }
+  });
+
+  // ─── Application Tracking Real-Time Events ────────────────────────────────
+  state.socket.on("running_apps_updated", (data) => {
+    if (data.device_id === state.selectedDeviceId) {
+      state.appsData.activeApp = data.active_app || null;
+      state.appsData.runningApps = data.running_apps || [];
+      state.appsData.activeTimers = data.active_timers || [];
+      updateLiveViewActiveAppPill(data.active_app);
+      if (state.currentPage === "apps") {
+        renderAppsPage();
+      }
+    }
+  });
+
+  state.socket.on("installed_apps_updated", (data) => {
+    if (data.device_id === state.selectedDeviceId) {
+      if (state.currentPage === "apps" && state.appsData.selectedTab === "installed") {
+        loadInstalledApps();
+      }
+    }
+  });
+
+  state.socket.on("app_timer_changed", (data) => {
+    if (data.device_id === state.selectedDeviceId) {
+      loadAppsOverview();
+    }
+  });
+
+  state.socket.on("child_message_status", (data) => {
+    if (data.device_id === state.selectedDeviceId) {
+      showToast(`Child received message: "${data.title}"`, "success");
+      loadChildMessages();
     }
   });
 }
@@ -463,7 +545,16 @@ function updateScreenView(payload) {
     const token = ++state.frameRenderToken;
     const preload = new Image();
     preload.onload = () => {
-      if (token !== state.frameRenderToken) return;
+      // Paint any frame newer than what is already on screen.
+      //
+      // The old test was `token !== state.frameRenderToken`, i.e. "discard this
+      // decode if a newer frame has even STARTED decoding". Once decode time
+      // exceeded the frame interval every frame lost that race, so nothing after
+      // the first frame was ever painted and the live view looked like a static
+      // image. Comparing against the last painted token instead means a frame is
+      // only dropped when a strictly newer one has already been shown.
+      if (token <= state.lastAppliedFrameToken) return;
+      state.lastAppliedFrameToken = token;
       img.src = nextSrc;
       img.style.display = "block";
       applyDisplaySettingsToView();
@@ -471,7 +562,7 @@ function updateScreenView(payload) {
       updatePresentationOverlay(meta);
     };
     preload.onerror = () => {
-      if (token !== state.frameRenderToken) return;
+      if (token <= state.lastAppliedFrameToken) return;
       updatePresentationOverlay(null);
     };
     preload.src = nextSrc;
@@ -575,6 +666,414 @@ function updateAlertBadge() {
   }
 }
 
+// ─── Application Tracking Data Loaders & Renderers ──────────────────────────
+
+async function loadAppsOverview(deviceId = state.selectedDeviceId) {
+  if (!deviceId) return;
+  try {
+    const data = await api(`/apps/overview/${deviceId}`);
+    if (!data) return;
+    state.appsData.activeApp = data.active_app || null;
+    state.appsData.runningApps = data.running_apps || [];
+    state.appsData.activeTimers = data.active_timers || [];
+    state.appsData.blockedApps = data.blocked_apps || [];
+    updateLiveViewActiveAppPill(data.active_app);
+    if (state.currentPage === "apps") {
+      renderAppsPage();
+    }
+  } catch (err) {
+    console.debug("Failed to load apps overview:", err);
+  }
+}
+
+async function loadInstalledApps(deviceId = state.selectedDeviceId) {
+  if (!deviceId) return;
+  try {
+    const data = await api(`/apps/installed/${deviceId}`);
+    state.appsData.installedApps = data || [];
+    if (state.currentPage === "apps" && state.appsData.selectedTab === "installed") {
+      renderInstalledAppsGrid();
+    }
+  } catch (err) {
+    console.debug("Failed to load installed apps:", err);
+  }
+}
+
+async function loadChildMessages(deviceId = state.selectedDeviceId) {
+  if (!deviceId) return;
+  try {
+    const data = await api(`/apps/messages/${deviceId}`);
+    state.appsData.messages = data || [];
+    if (state.currentPage === "apps" && state.appsData.selectedTab === "messages") {
+      renderChildMessagesList();
+    }
+  } catch (err) {
+    console.debug("Failed to load messages:", err);
+  }
+}
+
+function updateLiveViewActiveAppPill(activeApp) {
+  const pill = document.getElementById("live-active-app-pill");
+  const nameEl = document.getElementById("live-active-app-name");
+  if (!pill || !nameEl) return;
+
+  if (!activeApp || !activeApp.app_name || activeApp.app_name.includes("Desktop / System")) {
+    pill.style.display = "none";
+    return;
+  }
+
+  pill.style.display = "inline-flex";
+  nameEl.textContent = `🎯 ${activeApp.app_name}${activeApp.window_title ? ` — ${activeApp.window_title.slice(0, 30)}` : ""}`;
+}
+
+function renderAppsPage() {
+  renderActiveAppHero();
+  renderActiveTimersStrip();
+
+  // Update tab counts
+  const runCount = document.getElementById("running-apps-count");
+  if (runCount) runCount.textContent = state.appsData.runningApps.length;
+
+  const instCount = document.getElementById("installed-apps-count");
+  if (instCount) instCount.textContent = state.appsData.installedApps.length;
+
+  const blkCount = document.getElementById("blocked-apps-count");
+  if (blkCount) blkCount.textContent = state.appsData.blockedApps.length;
+
+  const msgCount = document.getElementById("messages-count");
+  if (msgCount) msgCount.textContent = state.appsData.messages.length;
+
+  if (state.appsData.selectedTab === "running") renderRunningAppsTable();
+  else if (state.appsData.selectedTab === "installed") renderInstalledAppsGrid();
+  else if (state.appsData.selectedTab === "blocked") renderBlockedAppsList();
+  else if (state.appsData.selectedTab === "messages") renderChildMessagesList();
+}
+
+function renderActiveAppHero() {
+  const hero = document.getElementById("apps-hero-card");
+  if (!hero) return;
+
+  const active = state.appsData.activeApp;
+  const name = active?.app_name || "Desktop / System";
+  const proc = active?.process_name || "explorer.exe";
+  const title = active?.window_title || "Monitoring desktop session...";
+  const pid = active?.pid || 0;
+  const ram = active?.memory_mb ? `${active.memory_mb} MB` : "--";
+  const durSec = active?.duration_sec || 0;
+  const durStr = durSec > 60 ? `${Math.floor(durSec / 60)}m ${durSec % 60}s` : `${durSec}s`;
+
+  let icon = "💻";
+  if (name.toLowerCase().includes("discord") || name.toLowerCase().includes("chat")) icon = "💬";
+  else if (name.toLowerCase().includes("chrome") || name.toLowerCase().includes("edge") || name.toLowerCase().includes("firefox")) icon = "🌐";
+  else if (name.toLowerCase().includes("game") || name.toLowerCase().includes("roblox") || name.toLowerCase().includes("steam") || name.toLowerCase().includes("minecraft")) icon = "🎮";
+  else if (name.toLowerCase().includes("code") || name.toLowerCase().includes("studio")) icon = "💻";
+  else if (name.toLowerCase().includes("spotify") || name.toLowerCase().includes("vlc") || name.toLowerCase().includes("media")) icon = "🎬";
+
+  const iconEl = document.getElementById("apps-hero-icon");
+  const nameEl = document.getElementById("apps-hero-name");
+  const titleEl = document.getElementById("apps-hero-title");
+  const procEl = document.getElementById("apps-hero-proc");
+  const durEl = document.getElementById("apps-hero-dur");
+  const memEl = document.getElementById("apps-hero-mem");
+
+  if (iconEl) iconEl.textContent = icon;
+  if (nameEl) nameEl.innerHTML = `${esc(name)} <span class="app-badge general">Active Focus</span>`;
+  if (titleEl) titleEl.textContent = title;
+  if (procEl) procEl.textContent = `${proc}${pid ? ` (PID: ${pid})` : ""}`;
+  if (durEl) durEl.textContent = durStr;
+  if (memEl) memEl.textContent = ram;
+
+  // Set data attributes on hero buttons for current active app
+  const closeBtn = document.getElementById("hero-close-app-btn");
+  const timerBtn = document.getElementById("hero-set-timer-btn");
+  const blockBtn = document.getElementById("hero-block-app-btn");
+
+  if (closeBtn) {
+    closeBtn.dataset.pid = String(pid);
+    closeBtn.dataset.proc = proc;
+    closeBtn.dataset.appName = name;
+  }
+  if (timerBtn) {
+    timerBtn.dataset.proc = proc;
+    timerBtn.dataset.appName = name;
+  }
+  if (blockBtn) {
+    blockBtn.dataset.proc = proc;
+    blockBtn.dataset.appName = name;
+  }
+}
+
+function renderActiveTimersStrip() {
+  const strip = document.getElementById("apps-timers-strip");
+  const grid = document.getElementById("apps-timers-grid");
+  if (!strip || !grid) return;
+
+  const timers = state.appsData.activeTimers || [];
+  if (timers.length === 0) {
+    strip.style.display = "none";
+    return;
+  }
+
+  strip.style.display = "block";
+  grid.innerHTML = timers
+    .map((t) => {
+      const rem = t.remaining_seconds != null ? t.remaining_seconds : Math.max(0, Math.round((t.expires_at - Date.now() / 1000)));
+      const mins = Math.floor(rem / 60);
+      const secs = rem % 60;
+      const timeLabel = `${mins}m ${secs < 10 ? "0" : ""}${secs}s`;
+
+      return `
+        <div class="apps-timer-card">
+          <div class="apps-timer-info">
+            <div class="apps-timer-app">⏱️ ${esc(t.app_name || t.process_name)}</div>
+            <div class="apps-timer-countdown">Closes in: <strong>${timeLabel}</strong></div>
+          </div>
+          <button class="btn btn-secondary btn-sm" data-cancel-timer="${esc(t.id || t.process_name)}">Cancel</button>
+        </div>
+      `;
+    })
+    .join("");
+}
+
+function renderRunningAppsTable() {
+  const wrap = document.getElementById("running-apps-table-wrap");
+  if (!wrap) return;
+
+  let list = state.appsData.runningApps || [];
+  const query = (state.appsData.runningSearch || "").toLowerCase().trim();
+
+  if (query) {
+    list = list.filter(
+      (a) =>
+        a.app_name.toLowerCase().includes(query) ||
+        a.process_name.toLowerCase().includes(query) ||
+        (a.username && a.username.toLowerCase().includes(query))
+    );
+  }
+
+  if (list.length === 0) {
+    wrap.innerHTML = `
+      <div class="empty-state">
+        <div class="icon">⚡</div>
+        <h3>No running user processes matching search</h3>
+        <p>Ensure the target device agent is online to view real-time applications.</p>
+      </div>
+    `;
+    return;
+  }
+
+  wrap.innerHTML = `
+    <table class="domain-table">
+      <thead>
+        <tr>
+          <th>Application</th>
+          <th>Process</th>
+          <th>Memory</th>
+          <th>PID</th>
+          <th>Uptime</th>
+          <th style="text-align: right;">Quick Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${list
+          .map((a) => {
+            const uptime = a.uptime_sec > 60 ? `${Math.floor(a.uptime_sec / 60)}m` : `${a.uptime_sec}s`;
+            const isBlocked = a.is_blocked;
+
+            return `
+              <tr>
+                <td>
+                  <strong>${esc(a.app_name)}</strong>
+                  ${isBlocked ? '<span class="app-badge games" style="margin-left:6px">Blocked</span>' : ""}
+                </td>
+                <td><code>${esc(a.process_name)}</code></td>
+                <td><span style="color: var(--accent-cyan); font-weight:600;">${a.memory_mb} MB</span></td>
+                <td><code>${a.pid}</code></td>
+                <td>${uptime}</td>
+                <td style="text-align: right;">
+                  <div style="display: inline-flex; gap: 0.35rem; justify-content: flex-end;">
+                    <button class="btn btn-secondary btn-sm" data-app-msg="${esc(a.app_name)}" title="Send message about this app">💬 Message</button>
+                    <button class="btn btn-warning btn-sm" data-app-timer="${esc(a.process_name)}" data-app-name="${esc(a.app_name)}" title="Set time limit">⏱️ Timer</button>
+                    <button class="btn btn-danger btn-sm" data-close-pid="${a.pid}" data-close-proc="${esc(a.process_name)}" data-app-name="${esc(a.app_name)}" title="Close app now anonymously">❌ Close</button>
+                    ${
+                      isBlocked
+                        ? `<button class="btn btn-secondary btn-sm" data-unblock-proc="${esc(a.process_name)}">Unblock</button>`
+                        : `<button class="btn btn-secondary btn-sm" data-block-proc="${esc(a.process_name)}" data-app-name="${esc(a.app_name)}" title="Add to blocklist">🚫 Block</button>`
+                    }
+                  </div>
+                </td>
+              </tr>
+            `;
+          })
+          .join("")}
+      </tbody>
+    </table>
+  `;
+}
+
+function renderInstalledAppsGrid() {
+  const wrap = document.getElementById("installed-apps-grid-wrap");
+  if (!wrap) return;
+
+  let list = state.appsData.installedApps || [];
+  const query = (state.appsData.installedSearch || "").toLowerCase().trim();
+  const cat = state.appsData.installedCategory || "all";
+
+  if (cat !== "all") {
+    list = list.filter((a) => a.category === cat);
+  }
+
+  if (query) {
+    list = list.filter(
+      (a) =>
+        a.app_name.toLowerCase().includes(query) ||
+        (a.process_name && a.process_name.toLowerCase().includes(query))
+    );
+  }
+
+  if (list.length === 0) {
+    wrap.innerHTML = `
+      <div class="empty-state">
+        <div class="icon">📦</div>
+        <h3>No installed applications found</h3>
+        <p>Click "Re-scan Device" to discover all programs on the target device.</p>
+      </div>
+    `;
+    return;
+  }
+
+  wrap.innerHTML = `
+    <div class="installed-apps-grid">
+      ${list
+        .map((app) => {
+          let icon = "📁";
+          if (app.category === "Games") icon = "🎮";
+          else if (app.category === "Social & Chat") icon = "💬";
+          else if (app.category === "Web Browser") icon = "🌐";
+          else if (app.category === "Media & Streaming") icon = "🎬";
+          else if (app.category === "Development") icon = "💻";
+
+          const isBlocked = app.is_blocked;
+
+          return `
+            <div class="installed-app-card">
+              <div class="installed-app-info">
+                <div class="installed-app-icon">${icon}</div>
+                <div class="installed-app-text">
+                  <div class="installed-app-name" title="${esc(app.app_name)}">${esc(app.app_name)}</div>
+                  <div class="installed-app-cat">${esc(app.category)} · <code>${esc(app.process_name || "app")}</code></div>
+                </div>
+              </div>
+              <div style="display: flex; gap: 0.35rem;">
+                <button class="btn btn-warning btn-sm" data-app-timer="${esc(app.process_name)}" data-app-name="${esc(app.app_name)}" title="Set time limit">⏱️</button>
+                ${
+                  isBlocked
+                    ? `<button class="btn btn-danger btn-sm" data-unblock-proc="${esc(app.process_name)}" title="Click to unblock">🚫 Blocked</button>`
+                    : `<button class="btn btn-secondary btn-sm" data-block-proc="${esc(app.process_name)}" data-app-name="${esc(app.app_name)}" data-cat="${esc(app.category)}" title="Block this application">Block</button>`
+                }
+              </div>
+            </div>
+          `;
+        })
+        .join("")}
+    </div>
+  `;
+}
+
+function renderBlockedAppsList() {
+  const wrap = document.getElementById("blocked-apps-table-wrap");
+  if (!wrap) return;
+
+  const list = state.appsData.blockedApps || [];
+  if (list.length === 0) {
+    wrap.innerHTML = `
+      <div class="empty-state">
+        <div class="icon">🚫</div>
+        <h3>No applications currently blocked</h3>
+        <p>Add a process name or app above (e.g. discord.exe, roblox, steam) to prevent it from launching.</p>
+      </div>
+    `;
+    return;
+  }
+
+  wrap.innerHTML = `
+    <table class="domain-table">
+      <thead>
+        <tr>
+          <th>Application Name</th>
+          <th>Process Match Rule</th>
+          <th>Category</th>
+          <th>Added By</th>
+          <th style="text-align: right;">Action</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${list
+          .map(
+            (b) => `
+            <tr>
+              <td><strong>${esc(b.app_name)}</strong></td>
+              <td><code>${esc(b.process_name)}</code></td>
+              <td><span class="category-badge ${b.category.toLowerCase()}">${esc(b.category)}</span></td>
+              <td>${esc(b.added_by || "admin")}</td>
+              <td style="text-align: right;">
+                <button class="btn btn-danger btn-sm" data-unblock-app-id="${b.id}">Remove Block</button>
+              </td>
+            </tr>
+          `
+          )
+          .join("")}
+      </tbody>
+    </table>
+  `;
+}
+
+function renderChildMessagesList() {
+  const wrap = document.getElementById("child-messages-table-wrap");
+  if (!wrap) return;
+
+  const list = state.appsData.messages || [];
+  if (list.length === 0) {
+    wrap.innerHTML = `
+      <div class="empty-state">
+        <div class="icon">💬</div>
+        <h3>No message history yet</h3>
+        <p>Send a quick reminder or alert directly to your child's screen using the button above.</p>
+      </div>
+    `;
+    return;
+  }
+
+  wrap.innerHTML = `
+    <table class="domain-table">
+      <thead>
+        <tr>
+          <th>Status</th>
+          <th>Title</th>
+          <th>Message</th>
+          <th>Urgency</th>
+          <th>Sent At</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${list
+          .map(
+            (m) => `
+            <tr>
+              <td>${m.delivered ? '<span style="color:var(--accent-green)">✅ Delivered</span>' : "⏳ Sent"}</td>
+              <td><strong>${esc(m.title)}</strong></td>
+              <td>${esc(m.message)}</td>
+              <td><span class="app-badge ${m.urgency === "urgent" ? "games" : m.urgency === "warning" ? "media" : "browser"}">${esc(m.urgency.toUpperCase())}</span></td>
+              <td>${timeAgo(m.created_at)}</td>
+            </tr>
+          `
+          )
+          .join("")}
+      </tbody>
+    </table>
+  `;
+}
+
 // ─── Renderers ──────────────────────────────────────────────────────────────
 
 function render() {
@@ -647,6 +1146,9 @@ function renderDashboard() {
           </button>
           <button class="nav-item" data-page="devices">
             <span class="icon">💻</span> Devices
+          </button>
+          <button class="nav-item" data-page="apps">
+            <span class="icon">🎮</span> Apps
           </button>
           <button class="nav-item" data-page="blocklist">
             <span class="icon">🚫</span> Blocklist
@@ -756,6 +1258,10 @@ function renderDashboard() {
                   <div><span>Current Focus</span><strong id="presentation-focus">active session</strong></div>
                   <div><span>Risk Score</span><strong id="presentation-risk">42/100</strong></div>
                 </div>
+              </div>
+              <div class="live-active-app-pill" id="live-active-app-pill" style="display:none">
+                <span class="pulse-dot"></span>
+                <span id="live-active-app-name">Active App</span>
               </div>
               <div class="live-badge" id="live-badge" style="display:none">
                 <div class="pulse"></div> LIVE
@@ -883,6 +1389,203 @@ function renderDashboard() {
               <div class="modal-actions">
                 <button class="btn btn-secondary" id="rules-cancel-add-btn" type="button">Cancel</button>
                 <button class="btn btn-primary rules-save-btn" id="rules-save-domain-btn" type="button">Save Rule</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Apps Page -->
+        <div class="page" id="page-apps">
+          <div class="apps-container">
+            <!-- Active Foreground App Hero Banner -->
+            <div class="apps-hero-card" id="apps-hero-card">
+              <div class="apps-hero-header">
+                <div class="apps-hero-info">
+                  <div class="apps-hero-icon" id="apps-hero-icon">💻</div>
+                  <div class="apps-hero-title-group">
+                    <h3 id="apps-hero-name">Desktop / System <span class="app-badge general">Active Focus</span></h3>
+                    <div class="apps-hero-window-title" id="apps-hero-title">Monitoring active desktop session...</div>
+                    <div class="apps-hero-meta" id="apps-hero-meta">
+                      <span>⚙️ Process: <strong id="apps-hero-proc">explorer.exe</strong></span>
+                      <span>⏱️ Active: <strong id="apps-hero-dur">0m</strong></span>
+                      <span>💾 RAM: <strong id="apps-hero-mem">--</strong></span>
+                    </div>
+                  </div>
+                </div>
+                <div class="apps-hero-actions" id="apps-hero-actions">
+                  <button class="btn btn-danger btn-sm" id="hero-close-app-btn">❌ Close App Now</button>
+                  <button class="btn btn-warning btn-sm" id="hero-set-timer-btn">⏱️ Set App Limit</button>
+                  <button class="btn btn-primary btn-sm" id="hero-send-msg-btn">💬 Send Message</button>
+                  <button class="btn btn-secondary btn-sm" id="hero-block-app-btn">🚫 Block App</button>
+                </div>
+              </div>
+            </div>
+
+            <!-- Active Timers Countdown Strip -->
+            <div class="apps-timers-section" id="apps-timers-strip" style="display:none">
+              <div class="apps-timers-title">⏳ Active App Time Limits</div>
+              <div class="apps-timers-grid" id="apps-timers-grid"></div>
+            </div>
+
+            <!-- Sub Navigation Tabs & Panels -->
+            <div class="card" style="padding: 1.25rem;">
+              <div class="apps-tabs">
+                <button class="apps-tab-btn active" data-apps-tab="running">
+                  <span>⚡</span> Live Running Apps <span class="tab-badge" id="running-apps-count">0</span>
+                </button>
+                <button class="apps-tab-btn" data-apps-tab="installed">
+                  <span>📦</span> Installed Applications <span class="tab-badge" id="installed-apps-count">0</span>
+                </button>
+                <button class="apps-tab-btn" data-apps-tab="blocked">
+                  <span>🚫</span> Blocked App Rules <span class="tab-badge" id="blocked-apps-count">0</span>
+                </button>
+                <button class="apps-tab-btn" data-apps-tab="messages">
+                  <span>💬</span> Message History <span class="tab-badge" id="messages-count">0</span>
+                </button>
+              </div>
+
+              <!-- Tab 1: Live Running Apps -->
+              <div class="apps-tab-panel active" id="tab-panel-running" style="margin-top: 1.25rem;">
+                <div class="apps-toolbar">
+                  <div class="apps-search-wrap">
+                    <span class="apps-search-icon">🔍</span>
+                    <input class="form-input" id="running-apps-search" type="text" placeholder="Search running processes or apps..." />
+                  </div>
+                  <div class="apps-category-filters">
+                    <button class="btn btn-secondary btn-sm" id="refresh-running-apps-btn">🔄 Refresh Processes</button>
+                    <button class="btn btn-primary btn-sm" id="open-new-msg-modal-btn">💬 Send Message to Child</button>
+                  </div>
+                </div>
+                <div id="running-apps-table-wrap"></div>
+              </div>
+
+              <!-- Tab 2: Installed Apps Catalog -->
+              <div class="apps-tab-panel" id="tab-panel-installed" style="margin-top: 1.25rem;">
+                <div class="apps-toolbar">
+                  <div class="apps-search-wrap">
+                    <span class="apps-search-icon">🔍</span>
+                    <input class="form-input" id="installed-apps-search" type="text" placeholder="Search 200+ discovered applications..." />
+                  </div>
+                  <div class="apps-category-filters" id="installed-cat-filters">
+                    <button class="apps-cat-chip active" data-cat="all">All Apps</button>
+                    <button class="apps-cat-chip" data-cat="Games">🎮 Games</button>
+                    <button class="apps-cat-chip" data-cat="Social & Chat">💬 Social & Chat</button>
+                    <button class="apps-cat-chip" data-cat="Web Browser">🌐 Browsers</button>
+                    <button class="apps-cat-chip" data-cat="Media & Streaming">🎬 Media</button>
+                    <button class="apps-cat-chip" data-cat="Development">💻 Dev</button>
+                    <button class="apps-cat-chip" data-cat="General">📁 General</button>
+                    <button class="btn btn-secondary btn-sm" id="rescan-installed-btn" style="margin-left:auto">🔄 Re-scan Device</button>
+                  </div>
+                </div>
+                <div id="installed-apps-grid-wrap"></div>
+              </div>
+
+              <!-- Tab 3: Blocked Apps Rules -->
+              <div class="apps-tab-panel" id="tab-panel-blocked" style="margin-top: 1.25rem;">
+                <div class="blocklist-header" style="margin-bottom: 1.25rem;">
+                  <input class="form-input" id="new-blocked-app-input" type="text" placeholder="Enter process or application name to block (e.g. discord.exe, roblox, steam)" />
+                  <select class="form-input" id="new-blocked-app-category" style="max-width: 180px;">
+                    <option value="Games">🎮 Games</option>
+                    <option value="Social & Chat">💬 Social & Chat</option>
+                    <option value="Media & Streaming">🎬 Media</option>
+                    <option value="Web Browser">🌐 Browser</option>
+                    <option value="General" selected>📁 General</option>
+                  </select>
+                  <button class="btn btn-primary" id="add-blocked-app-btn" style="width:auto">+ Block Application</button>
+                </div>
+                <div id="blocked-apps-table-wrap"></div>
+              </div>
+
+              <!-- Tab 4: Messages History -->
+              <div class="apps-tab-panel" id="tab-panel-messages" style="margin-top: 1.25rem;">
+                <div class="apps-toolbar">
+                  <h4 style="font-size: 0.95rem; font-weight: 600; color: var(--text-secondary);">Recent Direct Messages to Child's Screen</h4>
+                  <button class="btn btn-primary btn-sm" id="open-new-msg-modal-btn2">+ Send New Message</button>
+                </div>
+                <div id="child-messages-table-wrap"></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Modal 1: Send Child Message Modal -->
+          <div class="modal-overlay" id="app-msg-modal">
+            <div class="modal" style="max-width: 520px;">
+              <div class="modal-title">💬 Send Message to Child's Screen</div>
+              <p style="color: var(--text-secondary); font-size: 0.85rem; margin-bottom: 1.25rem;">
+                Displays a prominent floating banner directly on your child's screen.
+              </p>
+              <div class="form-group">
+                <label>Message Title</label>
+                <input id="msg-title-input" class="form-input" type="text" placeholder="e.g. Time to Study!" value="Parent Notice" />
+                <div class="msg-templates-group">
+                  <button class="msg-template-btn" type="button" data-tmpl-title="Time for Homework" data-tmpl-msg="Please pause games and finish your homework assignments now.">📚 Homework</button>
+                  <button class="msg-template-btn" type="button" data-tmpl-title="Dinner Time!" data-tmpl-msg="Dinner is ready! Please save your game and come to the kitchen.">🍽️ Dinner</button>
+                  <button class="msg-template-btn" type="button" data-tmpl-title="Computer Off in 5 Mins" data-tmpl-msg="Screen time is almost up for today. Wrap up in the next 5 minutes.">⏰ 5 Min Warning</button>
+                  <button class="msg-template-btn" type="button" data-tmpl-title="Bedtime" data-tmpl-msg="Time for bed. Shut down your PC and get ready for sleep.">🌙 Bedtime</button>
+                </div>
+              </div>
+              <div class="form-group">
+                <label>Message Body</label>
+                <textarea id="msg-body-input" class="form-input" rows="3" placeholder="Type what you want to say to your child..."></textarea>
+              </div>
+              <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
+                <div class="form-group">
+                  <label>Urgency Level</label>
+                  <select id="msg-urgency-select" class="form-input">
+                    <option value="info">ℹ️ Normal Notice (Blue)</option>
+                    <option value="warning" selected>⚠️ Warning (Yellow)</option>
+                    <option value="urgent">🚨 Urgent Alarm (Red)</option>
+                  </select>
+                </div>
+                <div class="form-group">
+                  <label>Display Duration</label>
+                  <select id="msg-duration-select" class="form-input">
+                    <option value="6">6 seconds</option>
+                    <option value="10" selected>10 seconds</option>
+                    <option value="20">20 seconds</option>
+                    <option value="30">30 seconds</option>
+                  </select>
+                </div>
+              </div>
+              <div class="modal-actions">
+                <button class="btn btn-secondary" id="cancel-msg-modal-btn" type="button">Cancel</button>
+                <button class="btn btn-primary" id="submit-send-msg-btn" type="button">🚀 Send to Child's Screen</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Modal 2: Set App Timer Modal -->
+          <div class="modal-overlay" id="app-timer-modal">
+            <div class="modal" style="max-width: 480px;">
+              <div class="modal-title">⏱️ Set App Usage Limit</div>
+              <p style="color: var(--text-secondary); font-size: 0.85rem; margin-bottom: 1.25rem;">
+                Automatically closes the application when the timer expires.
+              </p>
+              <div class="form-group">
+                <label>Target Application</label>
+                <input id="timer-app-name-input" class="form-input" type="text" readonly />
+                <input id="timer-process-name-hidden" type="hidden" />
+              </div>
+              <div class="form-group">
+                <label>Select Duration</label>
+                <div class="timer-presets">
+                  <button class="timer-preset-btn" type="button" data-timer-sec="300">5 min</button>
+                  <button class="timer-preset-btn" type="button" data-timer-sec="600">10 min</button>
+                  <button class="timer-preset-btn active" type="button" data-timer-sec="900">15 min</button>
+                  <button class="timer-preset-btn" type="button" data-timer-sec="1800">30 min</button>
+                  <button class="timer-preset-btn" type="button" data-timer-sec="2700">45 min</button>
+                  <button class="timer-preset-btn" type="button" data-timer-sec="3600">60 min</button>
+                  <button class="timer-preset-btn" type="button" data-timer-sec="5400">90 min</button>
+                  <button class="timer-preset-btn" type="button" data-timer-sec="7200">2 hours</button>
+                </div>
+              </div>
+              <div class="form-group">
+                <label>Or Custom Minutes</label>
+                <input id="timer-custom-min-input" class="form-input" type="number" min="1" max="720" placeholder="e.g. 25" />
+              </div>
+              <div class="modal-actions">
+                <button class="btn btn-secondary" id="cancel-timer-modal-btn" type="button">Cancel</button>
+                <button class="btn btn-primary" id="submit-timer-btn" type="button" style="background: var(--accent-orange); border-color: var(--accent-orange);">⏱️ Start Countdown Timer</button>
               </div>
             </div>
           </div>
@@ -1140,7 +1843,14 @@ function navigateTo(page) {
   });
 
   // Update title
-  const titles = { live: "Live View", devices: "Devices", blocklist: "Blocklist", rules: "Rules & Limits", alerts: "Alerts" };
+  const titles = {
+    live: "Live View",
+    devices: "Devices",
+    apps: "Application Tracking & Control",
+    blocklist: "Blocklist",
+    rules: "Rules & Limits",
+    alerts: "Alerts",
+  };
   const titleEl = document.getElementById("page-title");
   if (titleEl) {
     titleEl.textContent = state.controllerMode && page === "live"
@@ -1150,6 +1860,11 @@ function navigateTo(page) {
 
   // Load data for the page
   if (page === "blocklist") loadBlocklist();
+  if (page === "apps") {
+    loadAppsOverview();
+    loadInstalledApps();
+    loadChildMessages();
+  }
   if (page === "rules") {
     renderRulesPage();
     loadBlocklist();
@@ -1398,10 +2113,348 @@ function attachDashboardEvents() {
     pushStreamConfig();
   });
 
-  // Display output controls
-  document.getElementById("display-fit-mode")?.addEventListener("change", (e) => {
-    state.displaySettings.fit_mode = e.target.value === "cover" ? "cover" : "contain";
-    persistDisplaySettings();
+  // ─── Application Tracking Interactive Event Listeners ────────────────────
+
+  // Apps Subtab switching
+  document.addEventListener("click", (e) => {
+    const tabBtn = e.target.closest("[data-apps-tab]");
+    if (tabBtn) {
+      const tab = tabBtn.dataset.appsTab;
+      state.appsData.selectedTab = tab;
+
+      document.querySelectorAll("[data-apps-tab]").forEach((btn) => {
+        btn.classList.toggle("active", btn.dataset.appsTab === tab);
+      });
+
+      document.querySelectorAll(".apps-tab-panel").forEach((p) => {
+        p.classList.toggle("active", p.id === `tab-panel-${tab}`);
+      });
+
+      if (tab === "running") renderRunningAppsTable();
+      else if (tab === "installed") {
+        if (!state.appsData.installedApps.length) loadInstalledApps();
+        else renderInstalledAppsGrid();
+      } else if (tab === "blocked") renderBlockedAppsList();
+      else if (tab === "messages") {
+        if (!state.appsData.messages.length) loadChildMessages();
+        else renderChildMessagesList();
+      }
+    }
+
+    // Category filter chips in Installed Apps
+    const catChip = e.target.closest(".apps-cat-chip");
+    if (catChip) {
+      document.querySelectorAll(".apps-cat-chip").forEach((c) => c.classList.remove("active"));
+      catChip.classList.add("active");
+      state.appsData.installedCategory = catChip.dataset.cat || "all";
+      renderInstalledAppsGrid();
+    }
+
+    // Close App Now (anonymous / instant kill)
+    const closeBtn = e.target.closest("[data-close-pid], [data-close-proc], #hero-close-app-btn");
+    if (closeBtn && (closeBtn.id === "hero-close-app-btn" || closeBtn.dataset.closePid || closeBtn.dataset.closeProc)) {
+      const pid = closeBtn.dataset.closePid || closeBtn.dataset.pid;
+      const proc = closeBtn.dataset.closeProc || closeBtn.dataset.proc;
+      const appName = closeBtn.dataset.appName || proc || `PID ${pid}`;
+
+      if (!state.selectedDeviceId) {
+        showToast("Please select a device first", "warning");
+        return;
+      }
+
+      if (confirm(`Close application '${appName}' immediately on child's screen?`)) {
+        api("/apps/close", {
+          method: "POST",
+          body: JSON.stringify({
+            deviceId: state.selectedDeviceId,
+            pid: pid ? parseInt(pid, 10) : null,
+            process_name: proc,
+            app_name: appName,
+          }),
+        })
+          .then(() => {
+            showToast(`Closed ${appName}`, "success");
+            setTimeout(loadAppsOverview, 1000);
+          })
+          .catch((err) => showToast(err.message, "error"));
+      }
+    }
+
+    // Open Set App Timer Modal
+    const timerOpenBtn = e.target.closest("[data-app-timer], #hero-set-timer-btn");
+    if (timerOpenBtn) {
+      const proc = timerOpenBtn.dataset.appTimer || timerOpenBtn.dataset.proc || "";
+      const appName = timerOpenBtn.dataset.appName || proc || "Selected App";
+
+      const modal = document.getElementById("app-timer-modal");
+      const nameInput = document.getElementById("timer-app-name-input");
+      const procHidden = document.getElementById("timer-process-name-hidden");
+
+      if (modal && nameInput && procHidden) {
+        nameInput.value = appName;
+        procHidden.value = proc;
+        modal.classList.add("visible");
+      }
+    }
+
+    // Preset button selection inside Timer Modal
+    const presetBtn = e.target.closest(".timer-preset-btn");
+    if (presetBtn) {
+      document.querySelectorAll(".timer-preset-btn").forEach((b) => b.classList.remove("active"));
+      presetBtn.classList.add("active");
+    }
+
+    // Cancel active timer
+    const cancelTimerBtn = e.target.closest("[data-cancel-timer]");
+    if (cancelTimerBtn) {
+      const target = cancelTimerBtn.dataset.cancelTimer;
+      api(`/apps/timer/${encodeURIComponent(target)}`, { method: "DELETE" })
+        .then(() => {
+          showToast("App timer cancelled", "info");
+          loadAppsOverview();
+        })
+        .catch((err) => showToast(err.message, "error"));
+    }
+
+    // Open Send Child Message Modal
+    const msgOpenBtn = e.target.closest("[data-app-msg], #hero-send-msg-btn, #open-new-msg-modal-btn, #open-new-msg-modal-btn2");
+    if (msgOpenBtn) {
+      const appHint = msgOpenBtn.dataset.appMsg || "";
+      const modal = document.getElementById("app-msg-modal");
+      const bodyInput = document.getElementById("msg-body-input");
+
+      if (modal) {
+        if (appHint && bodyInput && !bodyInput.value) {
+          bodyInput.value = `Please wrap up what you are doing in ${appHint}.`;
+        }
+        modal.classList.add("visible");
+      }
+    }
+
+    // Template chip clicked in Message Modal
+    const tmplBtn = e.target.closest(".msg-template-btn");
+    if (tmplBtn) {
+      const titleInput = document.getElementById("msg-title-input");
+      const bodyInput = document.getElementById("msg-body-input");
+      if (titleInput && tmplBtn.dataset.tmplTitle) titleInput.value = tmplBtn.dataset.tmplTitle;
+      if (bodyInput && tmplBtn.dataset.tmplMsg) bodyInput.value = tmplBtn.dataset.tmplMsg;
+    }
+
+    // Block App quick action button
+    const blockBtn = e.target.closest("[data-block-proc], #hero-block-app-btn");
+    if (blockBtn) {
+      const proc = blockBtn.dataset.blockProc || blockBtn.dataset.proc;
+      const appName = blockBtn.dataset.appName || proc;
+      const cat = blockBtn.dataset.cat || "General";
+
+      if (!proc) {
+        showToast("Process name missing", "warning");
+        return;
+      }
+
+      if (confirm(`Block '${appName}' (${proc})? The agent will immediately kill it whenever launched.`)) {
+        api("/apps/blocked", {
+          method: "POST",
+          body: JSON.stringify({
+            deviceId: state.selectedDeviceId,
+            app_name: appName,
+            process_name: proc,
+            category: cat,
+          }),
+        })
+          .then(() => {
+            showToast(`Blocked application: ${appName}`, "success");
+            loadAppsOverview();
+            loadInstalledApps();
+          })
+          .catch((err) => showToast(err.message, "error"));
+      }
+    }
+
+    // Unblock App button by ID or process
+    const unblockAppBtn = e.target.closest("[data-unblock-app-id]");
+    if (unblockAppBtn) {
+      const id = unblockAppBtn.dataset.unblockAppId;
+      api(`/apps/blocked/${id}`, { method: "DELETE" })
+        .then(() => {
+          showToast("Application unblocked", "success");
+          loadAppsOverview();
+          loadInstalledApps();
+        })
+        .catch((err) => showToast(err.message, "error"));
+    }
+
+    const unblockProcBtn = e.target.closest("[data-unblock-proc]");
+    if (unblockProcBtn) {
+      const proc = unblockProcBtn.dataset.unblockProc.toLowerCase();
+      const existing = (state.appsData.blockedApps || []).find(
+        (b) => b.process_name.toLowerCase() === proc
+      );
+      if (existing) {
+        api(`/apps/blocked/${existing.id}`, { method: "DELETE" })
+          .then(() => {
+            showToast(`Unblocked ${existing.app_name}`, "success");
+            loadAppsOverview();
+            loadInstalledApps();
+          })
+          .catch((err) => showToast(err.message, "error"));
+      }
+    }
+
+    // Re-scan installed apps
+    const rescanBtn = e.target.closest("#rescan-installed-btn");
+    if (rescanBtn) {
+      if (!state.selectedDeviceId) {
+        showToast("Select a device first", "warning");
+        return;
+      }
+      rescanBtn.disabled = true;
+      rescanBtn.textContent = "Scanning...";
+      api(`/apps/installed/refresh/${state.selectedDeviceId}`, { method: "POST" })
+        .then(() => {
+          showToast("Scan command sent to device", "info");
+          setTimeout(() => {
+            rescanBtn.disabled = false;
+            rescanBtn.textContent = "🔄 Re-scan Device";
+            loadInstalledApps();
+          }, 3000);
+        })
+        .catch((err) => {
+          rescanBtn.disabled = false;
+          rescanBtn.textContent = "🔄 Re-scan Device";
+          showToast(err.message, "error");
+        });
+    }
+
+    // Refresh running apps button
+    const refreshRunningBtn = e.target.closest("#refresh-running-apps-btn");
+    if (refreshRunningBtn) {
+      loadAppsOverview();
+      showToast("Refreshed running processes", "info");
+    }
+  });
+
+  // Modal Cancel Buttons
+  document.getElementById("cancel-msg-modal-btn")?.addEventListener("click", () => {
+    document.getElementById("app-msg-modal")?.classList.remove("visible");
+  });
+
+  document.getElementById("cancel-timer-modal-btn")?.addEventListener("click", () => {
+    document.getElementById("app-timer-modal")?.classList.remove("visible");
+  });
+
+  // Submit Send Child Message
+  document.getElementById("submit-send-msg-btn")?.addEventListener("click", () => {
+    if (!state.selectedDeviceId) {
+      showToast("Please select a device first", "warning");
+      return;
+    }
+
+    const title = document.getElementById("msg-title-input")?.value.trim() || "Parent Notice";
+    const body = document.getElementById("msg-body-input")?.value.trim();
+    const urgency = document.getElementById("msg-urgency-select")?.value || "info";
+    const duration = parseInt(document.getElementById("msg-duration-select")?.value || "10", 10);
+
+    if (!body) {
+      showToast("Please enter a message", "warning");
+      return;
+    }
+
+    api("/apps/message", {
+      method: "POST",
+      body: JSON.stringify({
+        deviceId: state.selectedDeviceId,
+        title,
+        message: body,
+        urgency,
+        duration,
+      }),
+    })
+      .then(() => {
+        showToast("Message sent to child's screen!", "success");
+        document.getElementById("app-msg-modal")?.classList.remove("visible");
+        const bodyEl = document.getElementById("msg-body-input");
+        if (bodyEl) bodyEl.value = "";
+        loadChildMessages();
+      })
+      .catch((err) => showToast(err.message, "error"));
+  });
+
+  // Submit App Timer Limit
+  document.getElementById("submit-timer-btn")?.addEventListener("click", () => {
+    if (!state.selectedDeviceId) {
+      showToast("Please select a device first", "warning");
+      return;
+    }
+
+    const appName = document.getElementById("timer-app-name-input")?.value || "App";
+    const procName = document.getElementById("timer-process-name-hidden")?.value || appName;
+    const customMin = parseInt(document.getElementById("timer-custom-min-input")?.value || "0", 10);
+
+    let sec = 900; // default 15 min
+    if (customMin > 0) {
+      sec = customMin * 60;
+    } else {
+      const activePreset = document.querySelector(".timer-preset-btn.active");
+      if (activePreset && activePreset.dataset.timerSec) {
+        sec = parseInt(activePreset.dataset.timerSec, 10);
+      }
+    }
+
+    api("/apps/timer", {
+      method: "POST",
+      body: JSON.stringify({
+        deviceId: state.selectedDeviceId,
+        app_name: appName,
+        process_name: procName,
+        duration_seconds: sec,
+      }),
+    })
+      .then(() => {
+        showToast(`Timer set: ${appName} closes in ${Math.round(sec / 60)} min`, "success");
+        document.getElementById("app-timer-modal")?.classList.remove("visible");
+        loadAppsOverview();
+      })
+      .catch((err) => showToast(err.message, "error"));
+  });
+
+  // Add Manual Blocked App Form Submit
+  document.getElementById("add-blocked-app-btn")?.addEventListener("click", () => {
+    const input = document.getElementById("new-blocked-app-input");
+    const catSelect = document.getElementById("new-blocked-app-category");
+    const raw = (input?.value || "").trim();
+
+    if (!raw) {
+      showToast("Please enter an application or process name", "warning");
+      return;
+    }
+
+    api("/apps/blocked", {
+      method: "POST",
+      body: JSON.stringify({
+        deviceId: state.selectedDeviceId,
+        app_name: raw.replace(".exe", "").title || raw,
+        process_name: raw,
+        category: catSelect?.value || "General",
+      }),
+    })
+      .then(() => {
+        showToast(`Blocked application: ${raw}`, "success");
+        if (input) input.value = "";
+        loadAppsOverview();
+      })
+      .catch((err) => showToast(err.message, "error"));
+  });
+
+  // Search input listeners
+  document.getElementById("running-apps-search")?.addEventListener("input", (e) => {
+    state.appsData.runningSearch = e.target.value;
+    renderRunningAppsTable();
+  });
+
+  document.getElementById("installed-apps-search")?.addEventListener("input", (e) => {
+    state.appsData.installedSearch = e.target.value;
+    renderInstalledAppsGrid();
   });
 
   document.getElementById("display-zoom")?.addEventListener("input", (e) => {
@@ -1423,9 +2476,17 @@ function attachDashboardEvents() {
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 function esc(str) {
-  const div = document.createElement("div");
-  div.textContent = str || "";
-  return div.innerHTML;
+  // BUG-11: this used to escape via textContent → innerHTML, which handles
+  // & < > but leaves " and ' untouched. Most call sites interpolate into HTML
+  // attributes (title="...", data-app="..."), so an app name or window title
+  // containing a quote could close the attribute and inject markup — and those
+  // strings come straight off the monitored device. Escape quotes too.
+  return String(str == null ? "" : str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 function timeAgo(dateStr) {
