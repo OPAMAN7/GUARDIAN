@@ -524,6 +524,35 @@ class AppTracker:
 
         return active
 
+    def get_foreground_snapshot(self) -> dict:
+        """Read the focused window WITHOUT touching any shared duration state.
+
+        ``get_foreground_app()`` mutates ``self._last_active_app`` and
+        ``self._active_app_start_time`` outside the lock, and two loops
+        (``_collect_telemetry`` and ``_app_sync_loop``) already call it. Adding a
+        third caller would corrupt ``duration_sec`` for the other two: whichever
+        loop polled last resets the start time, so every reported duration
+        collapses towards zero.
+
+        The usage collector needs the raw fact ("what is focused right now") and
+        does its own session timing, so it uses this side-effect-free read
+        instead. ``duration_sec`` is intentionally always 0 here — the caller
+        owns the clock.
+
+        Added for the academic-progress collector (F-18). Nothing existing calls
+        it, so behaviour of the shipped Apps page is unchanged.
+        """
+        if platform.system() == "Windows":
+            snap = self._get_windows_foreground_app()
+        else:
+            snap = self._get_linux_foreground_app()
+        if not isinstance(snap, dict):
+            return {}
+        snap = dict(snap)
+        snap["duration_sec"] = 0
+        snap["sampled_at"] = time.time()
+        return snap
+
     def _get_windows_foreground_app(self) -> dict:
         import ctypes
         import ctypes.wintypes

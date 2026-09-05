@@ -21,13 +21,40 @@
   predates the server's socket-auth handshake**, so the browser socket was rejected as
   anonymous and never received frames. Nothing rebuilt the bundle. GUARD.py now builds it.
 - Next up: **`GUARD.bat build`, then hard-refresh the dashboard (Ctrl+Shift+R)** — without
-  this the live view cannot work whatever the Pi does. Then `GUARD.bat deploy` (or menu 3)
-  to ship screenshot.py, then `GUARD.bat diag` — its first line is the `Dashboard UI`
+  this the live view cannot work whatever the Pi does, and the new Progress page will not
+  appear at all (BUG-29 again — it is in `main.js`, so it only exists once `dist` is
+  rebuilt). Then `GUARD.bat deploy` (or menu 3) to ship screenshot.py **and the three new
+  progress collectors**, then `GUARD.bat diag` — its first line is the `Dashboard UI`
   freshness check; after that `CAPTURE_FAIL=0` + a non-empty `WAYLAND_SOCKETS` means the
   mirror should be live, and an empty `WAYLAND_SOCKETS` means no desktop session is logged
-  in on the Pi. After that BUG-03 (.env secrets) → BUG-06/07 (auth hardening) → BUG-09.
-- Child progress tracking: APPROVED, planning only. Roadmap = Weeks 6–8 in
-  docs/GUARDIAN_MASTER_PLAN.md. Nothing built yet, by design.
+  in on the Pi. `diag` also now reports `PROGRESS_FILES=3/3`, `PROGRESS_READY` and
+  `PROGRESS_QUEUED`, which is how to tell whether the collectors actually started.
+  After that BUG-03 (.env secrets) → BUG-06/07 (auth hardening) → BUG-09.
+- **Five things still need real hardware — none can be done from a sandbox:**
+  (1) `GUARD.bat build` on Windows, or the Progress page is invisible;
+  (2) `GUARD.bat deploy` to ship the collectors to the Pi;
+  (3) open the Progress page and click **Generate report** to make the first live Gemini
+  call (the key is an `AQ.` Vertex express key — that path is verified offline but has
+  never made a real request);
+  (4) `GUARD.bat telegram` (menu `M`) to paste the BotFather token and confirm the phone
+  actually buzzes, then restart the dashboard so the server re-reads `.env`;
+  (5) `TRANSFER-DATA.bat` once, to confirm sudo staging works on the real Pi.
+- Child progress tracking: **BUILT (2026-09-05), offline-verified, awaiting hardware
+  confirmation.** Was Phase 4 / Weeks 6–8 in docs/GUARDIAN_MASTER_PLAN.md; F-18..F-23 are
+  now code, not plan. Part of the basic product — no add-on, no gating, no licence check.
+  Three collectors on the Pi, a classifier + rollup + REST API on the server, a Progress
+  page in the dashboard, a Gemini-backed narrative, a Telegram alert channel and an SSH
+  data-pull command. 540 offline checks green across nine suites; nothing yet run on the Pi.
+- **App, web and YouTube history never mix.** `progress_daily` is keyed
+  `(device_id, day, source, category)` where source is `app` | `web` | `watch`, and each
+  source has its own category vocabulary. A maths lecture and a prank video are both
+  youtube.com and must never land in one bucket. The UI renders three separate sections
+  from three separate keys and concatenates nothing. If a change makes one source's number
+  appear under another, that is the regression to look for first.
+- Secrets: the Gemini key and the Telegram bot token live ONLY in
+  `parent-dashboard/server-ts/.env` (gitignored, untracked, server-side). Never in
+  guard_runtime.json, never in the browser bundle. The server reads .env at startup, so
+  **any .env change needs a dashboard restart** (menu 1).
 - Pi available: YES — user pi, hostname aman-test. The IP/credentials live ONLY in
   windows-app/config/guard_runtime.json (`pi_ip`, `server_ip`); read them from there,
   never hardcode. Values as of 2026-09-02: Pi 192.168.1.15, dashboard host
@@ -438,30 +465,34 @@ so there is nothing to capture — that is a Pi-side login problem, not an agent
 - [ ] F-14 Weekly PDF activity report export
 - [ ] F-15 Android/iOS monitoring expansion
 
-### Phase 4 — Child Progress Tracking (APPROVED 2026-09-02 — planning only, do NOT start)
+### Phase 4 — Child Progress Tracking (BUILT 2026-09-05 — offline-verified, unproven on hardware)
 
 Full day-by-day roadmap: **Weeks 6–8 in docs/GUARDIAN_MASTER_PLAN.md**.
-Locked decisions: browser history is read from the browser's own SQLite DBs on the
-device (no extension); ALL analysis runs through a cloud AI API (the Pi does no
-inference). Categories: education, creative, social, gaming, video, other.
+Locked decisions, all honoured by the implementation: browser history is read from the
+browser's own SQLite DBs on the device (no extension); ALL analysis runs through a cloud
+AI API (the Pi does no inference). Three disjoint category vocabularies, one per source.
 
-- [ ] F-18 Foreground app usage sessions — persist active-app time (`usage_sessions`)
-- [ ] F-19 Web history collection — Chromium `History` + Firefox `places.sqlite`,
-      copy-then-read, per-browser watermark, offline spool (`web_visits`)
-- [ ] F-20 YouTube / platform watch history — video URL + title + dwell time, own
-      category rules (a maths lecture and a prank video are both youtube.com)
-- [ ] F-21 Categorisation engine + progress score (`activity_categories`,
-      `progress_daily`, nightly rollup, parent overrides)
-- [ ] F-22 Progress dashboard page — score ring, 14-day stacked trend, top lists
-- [ ] F-23 AI insight section — weekly narrative from aggregates only, cached by
+- [x] F-18 Foreground app usage sessions — `pi-agent/agent/usage_tracker.py`, idle-trimmed
+      via xprintidle when present, spooled to `usage.jsonl`
+- [x] F-19 Web history collection — `pi-agent/agent/browser_history.py`, Chromium `History`
+      + Firefox `places.sqlite`, copy-then-read, per-browser watermark in
+      `history_state.json`, spooled to `web.jsonl`
+- [x] F-20 YouTube / platform watch history — same collector, `source='watch'` with its own
+      category rules, so a maths lecture and a prank video never share a bucket
+- [x] F-21 Categorisation engine + progress score — `server-ts/services/classifier.js` +
+      `rollup.js`, `progress_daily` keyed by `(device, day, source, category)`, parent
+      overrides via the rule editor (3-char minimum, BUG-13's lesson)
+- [x] F-22 Progress dashboard page — score ring, 14-day stacked trend, three separate
+      per-source sections; opened by `GUARD.bat progress` or menu `A`
+- [x] F-23 AI insight section — `server-ts/services/ai.js`, aggregates only, cached by
       input hash, daily call budget, degrades to plain numbers on failure
 - [ ] F-24 Goals & nudges — targets per day/week, misses raise a normal alert, optional
       encouraging overlay on the child's screen (rate-limited)
 - [ ] F-25 Progress section in the weekly PDF/email report
 
-**Dependency:** F-21 needs ~3 days of F-18/F-19/F-20 data before it shows anything
-real; F-23 needs a full week. Do not build the AI section first — it will hallucinate
-over an empty table.
+**Dependency, still true:** F-21 needs ~3 days of F-18/F-19/F-20 data before it shows
+anything real; F-23 needs a full week. Expect a thin-looking page on day one — that is the
+data, not a bug.
 
 ### Tooling / launcher
 
@@ -477,6 +508,24 @@ over an empty table.
       verbatim. Every deploy/recalibrate pushes it to pi-agent/agent/config.json
       and to the live Pi, and keeps the Windows agent on localhost.
       CLI: `GUARD.bat ip <addr|auto> [port]`, `GUARD.bat verify`, `GUARD.bat status`.
+- [x] F-26 Telegram phone alerts — COMPLETED (2026-09-05)
+      `GUARD.bat telegram` (or menu `M`) asks for the BotFather token, validates it with
+      `getMe`, discovers the chat id from `getUpdates` so no numeric id is ever typed by
+      hand, sends a confirmation message and writes the pair into
+      `parent-dashboard/server-ts/.env`. All-or-nothing: a token that fails its shape
+      check, a token Telegram rejects, or a valid token with no discoverable chat leaves
+      .env untouched — a half-configured channel would make the dashboard believe it can
+      alert while staying silent. `GUARD.bat telegram test` re-sends without the prompts.
+      Server side: `server-ts/services/telegram.js`, pushed from the socket `alert`
+      handler, fire-and-forget, deduped on the `alerts` row id via `notify_log`, hourly
+      ceiling (`TELEGRAM_MAX_PER_HOUR`, default 20).
+- [x] F-27 SSH data transfer — COMPLETED (2026-09-05)
+      `TRANSFER-DATA.bat` (double-click) or `GUARD.bat datapull` / menu `P`. Stages the
+      Pi's progress spool, agent logs, agent config and service journal into one /tmp
+      tarball, fetches it with `scp_pull()`, unpacks it under
+      `data-exports\<date_time>\` and deletes the remote copy. Read-only on the Pi:
+      nothing is stopped, restarted or killed, so it is safe while the child is using the
+      device. `data-exports/` is gitignored — it holds the child's real records.
 
 ---
 
@@ -487,20 +536,41 @@ Parent server:        parent-dashboard/server-ts/index.js  (Node.js, port 3000)
 Parent dashboard:     parent-dashboard/web-ts/main.js      (Vanilla JS SPA)
 Pi agent entry:       pi-agent/agent/main.py               (Python)
 App tracker module:   pi-agent/agent/app_tracker.py        (Python)
+Progress collectors:  pi-agent/agent/usage_tracker.py (apps), browser_history.py
+                      (web + YouTube), spool.py (offline queue)
+Progress server:      server-ts/services/classifier.js, rollup.js, ai.js;
+                      routes/progress.js; table progress_daily
+Alert channel:        server-ts/services/telegram.js; table notify_log
 Master launcher:      GUARD.bat  →  GUARD.py                (menu + subcommands)
-Launcher commands:    GUARD.bat [start|stop|status|deploy|verify|diag|ip|help]
+Data transfer:        TRANSFER-DATA.bat → GUARD.py datapull → data-exports\<date_time>\
+Server secrets:       parent-dashboard/server-ts/.env — GEMINI_API_KEY, TELEGRAM_BOT_TOKEN,
+                      TELEGRAM_CHAT_ID, JWT_SECRET, ADMIN_PASSWORD. Gitignored, untracked,
+                      never bundled. Read at startup, so changes need a dashboard restart.
+Launcher commands:    GUARD.bat [deploy|verify|diag|build|progress|telegram [test]|
+                      datapull|ip <addr> [port]|status]
                       Menu: 1 dashboard, 2 windows agent, 3 FULL Pi sync,
-                      4 config-only recalibrate, D deploy, I set server IP, T diag
+                      4 config-only recalibrate, 5 full init, 6 open dashboard,
+                      7 network report, 8 Pi host/user, 9 close all, 0 exit,
+                      D deploy, I set server IP, A academic progress,
+                      M connect Telegram, P pull Pi data, T diag
 Windows watchdog:     windows-app/watchdog/watchdog_server.py
-DB location:          parent-dashboard/server-ts/data/guardian.db (3.3 MB)
+DB location:          parent-dashboard/server-ts/data/guardian.db (~192 MB as of 2026-09-05
+                      — watch it; the 500 MB ceiling is a real rule, see BUG-01)
 Pi hostname:          aman-test (User: pi) — IP comes from guard_runtime.json, do not
                       hardcode it; it was 192.168.1.15 on 2026-09-02
 Windows host IP:      from guard_runtime.json `server_ip`:`server_port` (the address
                       agents connect to) — 192.168.1.10:3000 on 2026-09-02
 IP source of truth:   windows-app/config/guard_runtime.json (managed by GUARD.py)
 Pi install dir:       /opt/guardian-agent, systemd unit guardian-agent.service
+Agent state on Pi:    /root/.guardian-shield/{logs,progress} — the service runs as root, so
+                      a plain scp as user `pi` cannot read it; the data pull stages with sudo
 Screen capture:       grim (Wayland) → scrot (X11) → mss. "Device online" says nothing
                       about capture — check `GUARD.bat diag`.
+Test suites:          server-ts/tests/*.js (progress 98, ai 57, telegram 66),
+                      web-ts/tests/test_progress_ui.mjs (119),
+                      tools/test_guard_{deploy,telegram,datapull}.py (60, 65),
+                      pi-agent/tests/test_{agent_wiring,progress_collectors}.py (19, 56).
+                      All offline; `GUARDIAN_DB_PATH` keeps them off the real database.
 Default admin login:  admin / admin123  CHANGE THIS (BUG-03)
 
 ---
@@ -542,6 +612,35 @@ Default admin login:  admin / admin123  CHANGE THIS (BUG-03)
     rejected silently while every REST-driven part of the page keeps working. Run
     `GUARD.bat build` — the `Dashboard UI:` line in `GUARD.bat status` / `diag` says whether
     it is stale. This was BUG-29, and it hid the BUG-28 fix for a whole round of testing.
+15. Never let app, web and YouTube activity share a bucket. `progress_daily` is keyed
+    `(device_id, day, source, category)` with source in `app` | `web` | `watch`, and the
+    three sources have three separate category vocabularies on purpose. Never sum across
+    source to make a "total", never render one section from another's key, and never add a
+    category that means different things in two vocabularies.
+16. Never send anything but aggregates to the AI provider. `rollup.summarize()` is the
+    boundary: minutes per category per source, nothing else. No screenshots, no full URLs,
+    no filesystem paths. Page titles only when `AI_SEND_TITLES=true`, which defaults off.
+    If a new field is added to the prompt, document exactly what now leaves the network.
+17. Never put a secret in `windows-app/config/guard_runtime.json`. It is a plain runtime
+    config that gets opened, copied and pasted into chats when something breaks — and
+    `load_cfg()` silently drops any key missing from `DEFAULTS`, so a credential added there
+    can vanish without an error. Server secrets go in `server-ts/.env`, which is gitignored.
+18. Never add a key to `guard_runtime.json` without adding it to `DEFAULTS` in GUARD.py.
+    `load_cfg()` filters by `DEFAULTS`; an unlisted key is dropped with no message.
+19. Never write a Telegram credential that has not been validated. `action_telegram()` is
+    all-or-nothing on purpose: a saved-but-invalid token means the dashboard boots believing
+    it can reach the parent's phone and stays silent when it matters.
+20. Never make the alert push able to break the alert. The socket `alert` handler persists
+    the row first and calls `telegram.notifyAlert()` fire-and-forget with an explicit
+    `.catch()`. A duplicate phone push is worse than a missed one (the alert is already on
+    the dashboard), so the `notify_log` INSERT is claimed *before* the network call.
+21. Never make the SSH data pull mutate the Pi. It exists to read: no stop, no restart, no
+    `pkill`, no delete beyond the single /tmp archive it created. It must be safe to run
+    while the child is mid-session, and `data-exports/` must stay gitignored — those folders
+    are the child's real browsing and app records, the most sensitive data in the project.
+22. Never unpack a Pi-made archive with Windows `tar` or a bare `extractall`. A tarball is a
+    list of paths a remote machine chose; `_safe_extract()` rejects absolute paths, `..`
+    escapes and symlink members, and reports the count instead of dropping them silently.
 
 ---
 
@@ -562,6 +661,10 @@ Default admin login:  admin / admin123  CHANGE THIS (BUG-03)
 | 2026-09-02 | User reported option 3 and `GUARD.bat deploy` both failing ("check SSH+sudo password" / "Remote configure/restart failed") with the Pi never coming online. Root cause BUG-23: the remote chain's own `pkill -f guardian_watchdog.py` matched the SSH session's command line and SIGTERM'd it before `systemctl restart` ran. BUG-24..27 fixed alongside (is-active exit 3 masquerading as a config failure, sudo with no TTY, uncached plink host key, unbounded pip, deploy failing on a quiet local dashboard). Option 3 is now a FULL sync (upload + install-if-needed + restart + verify) and `GUARD.bat diag` / menu T dump the Pi's real state plus the journal tail. Verified offline: remote scripts executed locally against a stubbed sudo/systemctl/journalctl Pi — config patch preserves auth_token, survives a corrupt config.json, sed is idempotent across 5 start.sh layouts, restart reports active/failed/activating truthfully, all four failure branches print their own message. NOT yet run against the real Pi. |
 | 2026-09-02 | User reported everything working EXCEPT screen mirroring — device shows online, live view never paints, waiting does not help. Root cause BUG-28: `ScreenshotCapture.__init__` probed for a Wayland compositor exactly once; under systemd the agent starts before `/run/user/<uid>/wayland-0` exists, so it cached `None` and every frame for the rest of the process fell through to `scrot`, which cannot capture Wayland. The independent heartbeat kept the device "online", hiding it. Only surfaced now because the BUG-23 fix made `systemctl restart` actually run, moving the agent from a desktop session into systemd. FIXED in `pi-agent/agent/screenshot.py`: `_refresh_wayland_target()` re-probes from `capture()` while no backend works (5s throttle) and drops a session that stops producing frames. `GUARD.bat diag` now reports `GRIM`, `SCROT`, `WAYLAND_SOCKETS`, `CAPTURE_FAIL` and explains a live service with dead capture. `docs/MASTER_AI.md` rewritten: no hardcoded IP anywhere, new "Network Info — one source of truth" section for guard_runtime.json, full GUARD.bat command + menu map, diag marker table, rules 1-11. Verified offline: 7/7 checks (frame appears once the socket does; pre-fix semantics return None forever), py_compile clean. NOT yet run against the real Pi. |
 | 2026-09-02 | User re-ran everything from GUARD.bat and the mirror was STILL blank, toast: "No target device received stream settings". Root cause BUG-29 — nothing to do with the Pi: `web-ts/dist` was built 2026-08-26 21:48 while `main.js` / `server-ts/index.js` are 2026-09-02, and the server serves `dist` statically. The August bundle predates the socket auth handshake added in the BUG-16..22 round, so with `SOCKET_AUTH_REQUIRED` defaulting to true the browser socket was classified `anonymous`, never joined `dashboard-viewers`, and received zero `live_screenshot` frames; `stream_config` was rejected the same way (`delivered: 0` → that toast). REST-driven UI (device list, active-app pill) kept working, which made it look like a capture bug. Nothing rebuilt the bundle — `start-server.bat` installs server deps only. FIXED in GUARD.py: `web_bundle_state()` (nosrc/missing/stale/fresh, 1s jitter grace), `build_web_dashboard()` (npm install only if node_modules is absent, then `npm run build`), menu `1` builds before launching, new `GUARD.bat build [force]`, and a `Dashboard UI:` line at the top of `diag` and the end of `status`. `main.js`: the `Unauthorized` toast now blames the dashboard and says to rebuild instead of blaming the device. Verified offline: 10/10 checks against a temp tree with a stubbed npm (all four states, successful build, no-op when fresh, failing build, missing npm), and the check against the real tree correctly reports it stale. The real Vite build could NOT run here (npm registry blocked, only the Windows esbuild binary present) — it happens on the user's machine. |
+| 2026-09-05 | **Academic progress feature BUILT end to end** (F-18..F-23), as part of the basic product with no gating. Pi: `usage_tracker.py` (foreground app sessions, idle-trimmed via xprintidle), `browser_history.py` (Chromium `History` + Firefox `places.sqlite`, copy-then-read, per-browser watermark, YouTube split out as its own `watch` source), `spool.py` (offline JSONL queue under `/root/.guardian-shield/progress`), wired into `main.py` off the socket read loop. Server: `services/classifier.js` (three disjoint vocabularies), `services/rollup.js` (nightly rollup + the `summarize()` privacy boundary), `routes/progress.js` (authMiddleware on every route, `DELETE .../history` requires `{"confirm":"DELETE"}`), table `progress_daily` keyed `(device_id, day, source, category)` — the mechanism that keeps app, web and YouTube from ever mixing. Web: a Progress page with a score ring, a 14-day stacked trend and three separate per-source sections that concatenate nothing. Landmines avoided from the recon pass: no `ALTER TABLE` on the 192 MB live DB, no triple-counted time where an app session and a web visit overlap, no taxonomy clash between sources, no unlocked read/write race on the spool. Verified offline: progress server 98/98, UI 119/119, collectors 56/56, agent wiring 19/19. Not yet run on the Pi. |
+| 2026-09-05 | **AI narrative wired to a real key** (F-23). `services/ai.js` sends aggregates only — minutes per category per source out of `rollup.summarize()`, no screenshots, no full URLs, page titles gated behind `AI_SEND_TITLES` (default false). Cached by input hash with a daily call budget; on any failure the section degrades to the plain numbers instead of disappearing. Found and handled a trap: **Google issues two incompatible key formats.** `AIza…` is AI Studio (`generativelanguage.googleapis.com/v1beta/models/{model}:generateContent`); `AQ.…` is Vertex AI express mode (`aiplatform.googleapis.com/v1beta1/publishers/google/models/{model}:generateContent`). Same body, same response shape, different host — sending an `AQ.` key to AI Studio returns a bare 401 with no explanation. The flavour is detected from the key prefix and overridable with `AI_API_FLAVOR=studio\|vertex`. The user's key is an `AQ.` express key; verified offline against a throwaway DB (`GUARDIAN_DB_PATH=/tmp/verify-key.db`) that it resolves to the Vertex endpoint, that the key travels as an `x-goog-api-key` header and never in the URL, and that `status()` never contains it. 57/57 checks. The live call itself needs the user's machine — the sandbox has no egress. |
+| 2026-09-05 | **Telegram phone alerts** (F-26). `GUARD.bat telegram` / menu `M` takes the BotFather token, validates it with `getMe`, discovers the chat id from `getUpdates` (so no numeric id is ever typed by hand), sends a confirmation, and writes the pair into `server-ts/.env` under a self-documenting header. All-or-nothing: a malformed token, a token Telegram rejects, or a valid token with no discoverable chat all leave `.env` byte-identical — a saved-but-invalid token would make the dashboard believe it can alert while staying silent. Credentials deliberately NOT in `guard_runtime.json` (`load_cfg()` drops keys missing from `DEFAULTS`, and that file gets pasted into chats). Server side `services/telegram.js`: pushed from the socket `alert` handler fire-and-forget with an explicit `.catch()` so an outbound HTTP call can never break the alert path; the `notify_log` INSERT is claimed **before** the network call, so one alert is one message even across a restart; hourly ceiling (default 20) drops rather than queues; `parse_mode: HTML` because a child's window title is full of MarkdownV2 specials; one detail field only, so full URLs and `/home/pi/` paths never reach the phone. `.env` editing is surgical — the same file holds `JWT_SECRET` and `ADMIN_PASSWORD`, and a regression there destroys a credential without throwing. Verified offline: 66/66 server checks (including "a restarted server does not re-push an old alert" and "a throwing provider produces no unhandled rejection") and 60/60 GUARD checks. The actual phone push needs the user's token. |
+| 2026-09-05 | **SSH data transfer** (F-27). `TRANSFER-DATA.bat`, `GUARD.bat datapull`, menu `P`. The agent runs as root, so its records sit in `/root/.guardian-shield/{progress,logs}` where a plain scp as `pi` cannot read them; the remote step therefore stages with `sudo -n cp -a`, writes a MANIFEST, hands ownership back to the SSH user and tars once — one fetch instead of a dozen sudo round trips, because a partial set of them is indistinguishable from "the child used nothing today". Built as a `"; "`-joined command like every other remote command here, **not** a `bash -lc '...'` wrapper: `sudo_preamble()` itself contains single quotes, so a single-quoted wrapper would end early and leak the sudo password as an argument. No `pkill`, no stop, no restart anywhere in the chain (BUG-23), so it is safe to run mid-session. Unpacked locally with Python's `tarfile`, never Windows `tar`: `_safe_extract()` rejects absolute paths, `..` escapes and symlink members and reports the count. Lands in `data-exports\<date_time>\`, one folder per run, never overwritten; `data-exports/` and stray `guardian-export-*.tar.gz` added to `.gitignore` because those files are the child's real records. Every failure mode returns non-zero — an empty remote archive, an SSH refusal, a failed download, scp claiming success with no file, a corrupt archive — because this is the one command likely to end up in a scheduled task and a silent 0 would look like a nightly archive that is quietly empty. Verified offline: 65/65 checks with SSH and scp stubbed, including a deliberately malicious tarball. |
 
 ---
 

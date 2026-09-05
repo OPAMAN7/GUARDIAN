@@ -20,6 +20,9 @@ const {
   activeTimersCache,
   broadcastBlockedApps,
 } = require("./routes/apps");
+const { ingestBatch } = require("./services/progressIngest");
+const rollup = require("./services/rollup");
+const telegram = require("./services/telegram");
 
 // ─── Express Setup ──────────────────────────────────────────────────────────
 
@@ -154,6 +157,70 @@ function touchDeviceOnline(deviceId, deviceName, socketId) {
   } catch (err) {
     console.error(`Device liveness update error: ${err.message}`);
   }
+}
+
+/**
+ * Resolve the device row for an agent socket, tolerating a socket that has not
+ * finished register_device yet.
+ *
+ * Copied from the running_apps_report idiom rather than shared with it, because
+ * that handler silently returns on an unknown device while the progress handlers
+ * have to answer the agent — an unanswered ack means the agent retries the same
+ * batch every 30 seconds forever.
+ */
+function resolveAgentDeviceId(socket, data) {
+  if (socket.deviceId) return socket.deviceId;
+  const name = socket.deviceName || (data && data.device_name);
+  if (!name) return null;
+  try {
+    const dev = db.prepare("SELECT id FROM devices WHERE device_name = ?").get(name);
+    if (dev) {
+      socket.deviceId = dev.id;
+      return dev.id;
+    }
+  } catch (err) {
+    console.error(`[progress] device lookup failed: ${err.message}`);
+  }
+  return null;
+}
+
+/**
+ * Ingest one spooled progress batch, acknowledge it, then recompute the days it
+ * touched.
+ *
+ * Order matters. The ack goes out first so the agent can free its spool without
+ * waiting on ledger maths, and the rollup runs on the next tick where a failure
+ * is logged instead of turning into an agent-side retry loop.
+ */
+function handleProgressBatch(socket, ledger, data, ack) {
+  const reply = typeof ack === "function" ? ack : () => {};
+  if (!data) return reply({ ok: false, error: "empty payload" });
+
+  const devId = resolveAgentDeviceId(socket, data);
+  if (!devId) {
+    // Explicit refusal, not silence: the agent keeps the records and retries
+    // once registration has actually happened.
+    return reply({ ok: false, error: "unknown device" });
+  }
+
+  const result = ingestBatch(devId, ledger, data.records);
+  reply(result);
+
+  if (!result.ok || !result.days || !result.days.length) return;
+  touchDeviceOnline(devId, socket.deviceName || data.device_name, socket.id);
+  setImmediate(() => {
+    try {
+      rollup.rollupMany(result.days);
+      emitToViewers("progress_updated", {
+        device_id: devId,
+        ledger,
+        accepted: result.accepted,
+        days: result.days.map((d) => String(d).split("|")[1]),
+      });
+    } catch (err) {
+      console.error(`[progress] rollup after ${ledger} batch failed: ${err.message}`);
+    }
+  });
 }
 
 // Mark sockets as stale if they stop sending heartbeats/screenshots. The sweeper
@@ -479,7 +546,7 @@ io.on("connection", (socket) => {
     console.log(`⚠️ Alert from ${device_name}: [${type}] ${message}`);
 
     // Store in database
-    db.prepare(
+    const inserted = db.prepare(
       `INSERT INTO alerts (device_id, alert_type, message, details)
        VALUES (?, ?, ?, ?)`
     ).run(
@@ -498,6 +565,15 @@ io.on("connection", (socket) => {
       details,
       timestamp,
     });
+
+    // Push to the parent's phone. Fire and forget by design: the alert is already
+    // persisted and on the dashboard, so this handler must never wait on — or be
+    // broken by — an outbound HTTP call. The alerts row id is the dedupe key, so
+    // one alert produces exactly one message even if the server restarts.
+    telegram.notifyAlert(
+      { device_name, type, message, details },
+      inserted.lastInsertRowid
+    );
   });
 
   /**
@@ -592,6 +668,31 @@ io.on("connection", (socket) => {
     } catch (err) {
       console.error(`[apps] Error persisting installed apps: ${err.message}`);
     }
+  });
+
+  /**
+   * Academic-progress ingest — foreground app sessions.
+   *
+   * Acknowledged, unlike every other agent event here: the agent keeps these
+   * records in an on-disk spool and only deletes a batch once the server says it
+   * has them. An un-acked batch is retried on the next tick, so a dashboard
+   * restart in the middle of an upload costs nothing.
+   *
+   * The rollup runs after the ack, not before it. Recomputing a day is fast, but
+   * it is not the agent's problem — making it wait would put ledger maths on the
+   * critical path of a 20-second socket timeout.
+   */
+  socket.on("usage_batch", (data, ack) => {
+    handleProgressBatch(socket, "usage", data, ack);
+  });
+
+  /**
+   * Academic-progress ingest — browser history (web + YouTube).
+   * A separate event from usage_batch on purpose: the two ledgers never travel
+   * in the same batch, so no server-side bug can merge their seconds.
+   */
+  socket.on("web_batch", (data, ack) => {
+    handleProgressBatch(socket, "web", data, ack);
   });
 
   /**
@@ -730,6 +831,10 @@ app.use("/api/devices", require("./routes/devices"));
 app.use("/api/blocklist", require("./routes/blocklist"));
 app.use("/api/alerts", require("./routes/alerts"));
 app.use("/api/apps", appsRouter);
+// Academic progress. Mounted with the other routers so it is registered before
+// the app.get("*") SPA fallback further down — after it, every progress request
+// would be answered with index.html and the page would silently show no data.
+app.use("/api/progress", require("./routes/progress"));
 
 // Get latest screenshot for a device
 app.get("/api/screenshots/latest/:deviceId", (req, res) => {

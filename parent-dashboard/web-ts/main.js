@@ -76,6 +76,31 @@ const state = {
     installedSearch: "",
     installedCategory: "all",
   },
+  // Academic progress. It carries its own deviceId on purpose: progress is
+  // historical, and state.selectedDeviceId is null whenever no device is online,
+  // so last week's grades must stay readable with the Pi switched off.
+  progress: {
+    deviceId: null,
+    date: null,       // the day being inspected; null means "today"
+    rubric: null,     // GET /progress/rubric — fetched once, never hardcoded here
+    day: null,        // { day, score, ledger: { app, web, watch } }
+    trend: [],
+    summary: null,
+    detail: null,     // { app, web, watch, browser_envelope }
+    goals: null,
+    rules: null,
+    windowDays: 7,
+    ruleSource: "app",
+    // AI report. `aiStatus` is the provider situation (booleans only — the key
+    // itself never leaves the server), `insight` is the last report written, and
+    // `aiResult` carries the reason/payload from the most recent Generate click.
+    aiStatus: null,
+    insight: null,
+    aiResult: null,
+    aiBusy: false,
+    loading: false,
+    error: null,
+  },
 };
 
 // ─── API Helper ─────────────────────────────────────────────────────────────
@@ -479,6 +504,15 @@ function initSocket() {
       loadChildMessages();
     }
   });
+
+  // The server emits this after every ingest+rollup. It is matched against the
+  // Progress page's own device, not state.selectedDeviceId, because the page is
+  // often looking at a device that is not the currently mirrored one.
+  state.socket.on("progress_updated", (data) => {
+    if (state.currentPage !== "progress") return;
+    if (data && data.device_id && data.device_id !== state.progress.deviceId) return;
+    loadProgress();
+  });
 }
 
 function updateConnectionStatus() {
@@ -610,6 +644,89 @@ async function loadBlocklist() {
     if (state.currentPage === "rules") renderRulesPage();
   } catch (e) {
     console.error("Failed to load blocklist:", e);
+  }
+}
+
+// ─── Academic Progress loaders ──────────────────────────────────────────────
+// Six endpoints, fetched together and rendered once, so the page never shows a
+// grade next to a ledger from a different request.
+
+/** Local YYYY-MM-DD — the same basis the agent stamps `day` with. */
+function progressDayString(d = new Date()) {
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+/** The device the Progress page is reading, falling back to any known device. */
+function progressDeviceId() {
+  const p = state.progress;
+  if (p.deviceId && state.devices.some((d) => d.id === p.deviceId)) return p.deviceId;
+  const fallback = state.selectedDeviceId
+    || (state.devices.find((d) => d.status === "online") || state.devices[0] || {}).id
+    || null;
+  p.deviceId = fallback || null;
+  return p.deviceId;
+}
+
+async function loadProgress() {
+  const p = state.progress;
+  const deviceId = progressDeviceId();
+  if (!deviceId) {
+    p.day = null;
+    p.trend = [];
+    p.summary = null;
+    p.detail = null;
+    p.goals = null;
+    p.insight = null;
+    p.aiResult = null;
+    p.error = null;
+    if (state.currentPage === "progress") renderProgressPage();
+    return;
+  }
+  const day = p.date || progressDayString();
+  const win = p.windowDays;
+  p.loading = true;
+  p.error = null;
+  if (state.currentPage === "progress") renderProgressPage();
+  try {
+    // api() answers null on a 401 (it re-renders the login screen itself), so
+    // every result below is defaulted rather than trusted.
+    const [rubric, dayData, trend, summary, detail, goals, aiStatus, insight] = await Promise.all([
+      p.rubric ? Promise.resolve(p.rubric) : api("/progress/rubric"),
+      api(`/progress/${deviceId}/day?date=${encodeURIComponent(day)}`),
+      api(`/progress/${deviceId}/trend?days=14`),
+      api(`/progress/${deviceId}/summary?days=${win}`),
+      api(`/progress/${deviceId}/detail?days=${win}&limit=12`),
+      api(`/progress/${deviceId}/goals`),
+      api("/progress/ai/status"),
+      api(`/progress/${deviceId}/insight`),
+    ]);
+    p.rubric = rubric || p.rubric;
+    p.day = dayData || null;
+    p.trend = (trend && trend.points) || [];
+    p.summary = summary || null;
+    p.detail = detail || null;
+    p.goals = goals || null;
+    p.aiStatus = aiStatus || p.aiStatus;
+    // A stored report belongs to the device, not to the click — reloading the
+    // page keeps showing it, and the button only ever adds a newer one.
+    p.insight = (insight && insight.insight) || null;
+    p.aiResult = null;
+  } catch (err) {
+    p.error = err.message || "Could not load progress data";
+    console.error("Failed to load progress:", err);
+  } finally {
+    p.loading = false;
+    if (state.currentPage === "progress") renderProgressPage();
+  }
+}
+
+async function loadProgressRules() {
+  try {
+    state.progress.rules = (await api("/progress/rules")) || null;
+    if (state.currentPage === "progress") renderProgressRules();
+  } catch (err) {
+    console.error("Failed to load category rules:", err);
   }
 }
 
@@ -1101,7 +1218,7 @@ function render() {
   initSocket();
   loadDevices().then(() => {
     renderDevicesList();
-    navigateTo(state.currentPage);
+    navigateTo(pageFromHash() || state.currentPage);
   });
   loadAlerts();
 }
@@ -1149,6 +1266,9 @@ function renderDashboard() {
           </button>
           <button class="nav-item" data-page="apps">
             <span class="icon">🎮</span> Apps
+          </button>
+          <button class="nav-item" data-page="progress">
+            <span class="icon">🎓</span> Progress
           </button>
           <button class="nav-item" data-page="blocklist">
             <span class="icon">🚫</span> Blocklist
@@ -1282,6 +1402,26 @@ function renderDashboard() {
             </div>
             <div id="devices-table-wrap"></div>
           </div>
+        </div>
+
+        <!-- Academic Progress Page -->
+        <!-- Three source panels, three vocabularies, one grade. Nothing on this
+             page ever adds a number from one panel to a number from another. -->
+        <div class="page" id="page-progress">
+          <div class="card prog-toolbar" id="progress-toolbar"></div>
+          <div id="progress-banner"></div>
+          <div class="prog-split">
+            <div class="card" id="progress-grade-card"></div>
+            <div class="card" id="progress-bands-card"></div>
+          </div>
+          <div class="card" id="progress-trend-card"></div>
+          <div class="prog-source-grid" id="progress-sources"></div>
+          <div class="card" id="progress-envelope-card"></div>
+          <div class="prog-split">
+            <div class="card" id="progress-ai-card"></div>
+            <div class="card" id="progress-goals-card"></div>
+          </div>
+          <div class="card" id="progress-rules-card"></div>
         </div>
 
         <!-- Blocklist Page -->
@@ -1751,6 +1891,645 @@ function renderBlocklistPage() {
   `;
 }
 
+// ─── Academic Progress rendering ────────────────────────────────────────────
+// The rule this whole section exists to honour: applications, websites and
+// YouTube are rendered in three separate panels with three separate
+// vocabularies, and no element on this page ever adds a number from one panel
+// to a number from another. Browser app time is shown, labelled, and excluded.
+
+const PROG_BANDS = [
+  ["academic", "Academic", "academic_sec"],
+  ["constructive", "Constructive", "constructive_sec"],
+  ["neutral", "Neutral", "neutral_sec"],
+  ["passive", "Passive", "passive_sec"],
+  ["distraction", "Distraction", "distraction_sec"],
+];
+
+const PROG_SOURCES = [
+  ["app", "💻", "Applications",
+    "Foreground app time. Browsers are excluded here — see the envelope below."],
+  ["web", "🌐", "Websites",
+    "Browser history minus YouTube. Domains only; no search terms are ever stored."],
+  ["watch", "▶️", "YouTube",
+    "Graded on its own watch categories, never on the website ones."],
+];
+
+function fmtDur(sec) {
+  const s = Math.max(0, Math.round(Number(sec) || 0));
+  if (s < 60) return `${s}s`;
+  const h = Math.floor(s / 3600);
+  const m = Math.round((s % 3600) / 60);
+  if (!h) return `${m}m`;
+  return m ? `${h}h ${m}m` : `${h}h`;
+}
+
+function fmtPct(v) {
+  return `${Math.round(Number(v) || 0)}%`;
+}
+
+/** Which score band a stored weight belongs to. Mirrors rollup's band(). */
+function progBand(weight) {
+  const w = Number(weight) || 0;
+  if (w >= 2) return "academic";
+  if (w === 1) return "constructive";
+  if (w === 0) return "neutral";
+  if (w === -1) return "passive";
+  return "distraction";
+}
+
+/** study_tools -> "Study tools". Category keys are never shown raw. */
+function progCatLabel(cat) {
+  return String(cat || "other").replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase());
+}
+
+function progShiftDate(days) {
+  const base = new Date(`${state.progress.date || progressDayString()}T12:00:00`);
+  base.setDate(base.getDate() + days);
+  const next = progressDayString(base);
+  if (next > progressDayString()) return;
+  state.progress.date = next;
+  loadProgress();
+}
+
+function renderProgressPage() {
+  const p = state.progress;
+  renderProgressToolbar();
+  const banner = document.getElementById("progress-banner");
+  if (banner) {
+    banner.innerHTML = p.error
+      ? `<div class="card prog-banner error">⚠️ ${esc(p.error)}</div>`
+      : p.loading
+        ? `<div class="card prog-banner">Loading progress data…</div>`
+        : "";
+  }
+  renderProgressGrade();
+  renderProgressBands();
+  renderProgressTrend();
+  renderProgressSources();
+  renderProgressEnvelope();
+  renderProgressAi();
+  renderProgressGoals();
+  renderProgressRules();
+}
+
+function renderProgressToolbar() {
+  const el = document.getElementById("progress-toolbar");
+  if (!el) return;
+  const p = state.progress;
+  const activeId = progressDeviceId();
+  const day = p.date || (p.day && p.day.day) || progressDayString();
+  const today = progressDayString();
+  const options = state.devices.length
+    ? state.devices
+      .map(
+        (d) =>
+          `<option value="${d.id}"${d.id === activeId ? " selected" : ""}>${esc(d.device_name)}${d.status === "online" ? "" : " · offline"}</option>`
+      )
+      .join("")
+    : `<option value="">No devices registered yet</option>`;
+
+  el.innerHTML = `
+    <div class="prog-toolbar-row">
+      <label class="prog-field">
+        <span>Child device</span>
+        <select class="form-input" id="progress-device">${options}</select>
+      </label>
+      <label class="prog-field">
+        <span>Day</span>
+        <span class="prog-date-row">
+          <button class="btn btn-sm" data-progress-shift="-1" title="Previous day">‹</button>
+          <input class="form-input" type="date" id="progress-date" value="${esc(day)}" max="${esc(today)}" />
+          <button class="btn btn-sm" data-progress-shift="1" title="Next day"${day >= today ? " disabled" : ""}>›</button>
+        </span>
+      </label>
+      <label class="prog-field">
+        <span>Summary window</span>
+        <select class="form-input" id="progress-window">
+          ${[7, 14, 30]
+            .map((n) => `<option value="${n}"${n === p.windowDays ? " selected" : ""}>Last ${n} days</option>`)
+            .join("")}
+        </select>
+      </label>
+      <span class="prog-toolbar-actions">
+        <button class="btn btn-sm" id="progress-refresh-btn">🔄 Refresh</button>
+        <button class="btn btn-sm" id="progress-rebuild-btn"
+          title="Re-apply the current categories to stored history and rebuild the grades">♻️ Recalculate</button>
+      </span>
+    </div>`;
+}
+
+/** Grade letter -> CSS suffix. "A+" and "A" must not collide, "N/A" has a slash. */
+function progGradeKey(grade) {
+  const g = String(grade || "N/A").toUpperCase();
+  if (g === "N/A") return "na";
+  return g.replace("+", "plus").toLowerCase();
+}
+
+function renderProgressGrade() {
+  const el = document.getElementById("progress-grade-card");
+  if (!el) return;
+  const p = state.progress;
+  const day = (p.day && p.day.day) || p.date || progressDayString();
+  const head = `
+    <div class="card-header">
+      <div class="card-title">🎓 Academic Activity Grade</div>
+      <span class="prog-daylabel">${esc(day)}</span>
+    </div>`;
+  const s = (p.day && p.day.score) || null;
+  if (!s) {
+    el.innerHTML = `${head}
+      <div class="empty-state">
+        <div class="icon">🎓</div>
+        <h3>No progress data yet</h3>
+        <p>A grade appears once the agent has uploaded app, browser or YouTube activity.</p>
+      </div>`;
+    return;
+  }
+  const hasData = Number(s.has_data) === 1;
+  const grade = hasData ? String(s.grade || "N/A") : "N/A";
+  const sum = p.summary;
+  // __PROG_MATH__
+  // Every component of the score is printed, not just the result: a parent who
+  // cannot reproduce the number by hand has no reason to believe it.
+  const math = [
+    ["Academic time", fmtDur(s.academic_sec), "weight +2"],
+    ["Constructive time", fmtDur(s.constructive_sec), "weight +1, counts half toward effort"],
+    ["Effort", fmtDur(s.effort_sec), "academic + 0.5 × constructive"],
+    ["Daily target", fmtDur(s.target_sec), "set under Daily goal below"],
+    ["Attainment", fmtPct(s.attainment_pct), "effort ÷ target, capped at 100%"],
+    ["Counted time", fmtDur(s.counted_sec), "all five bands, browser envelope excluded"],
+    ["Focus", fmtPct(s.focus_pct), "effort ÷ counted time"],
+    ["Distraction penalty", `−${(Number(s.penalty) || 0).toFixed(2)} pts`, "up to 15, by distraction share"],
+  ];
+  el.innerHTML = `${head}
+    <div class="prog-hero">
+      <div class="prog-grade grade-${progGradeKey(grade)}">
+        <span class="prog-grade-letter">${esc(grade)}</span>
+        <span class="prog-grade-score">${hasData ? `${Number(s.score) || 0} / 100` : "not enough data"}</span>
+      </div>
+      <div class="prog-hero-side">
+        <div class="prog-hero-stat">
+          <span class="prog-hero-label">Last ${p.windowDays} days</span>
+          <strong>${esc((sum && sum.grade) || "N/A")}${sum && sum.active_days ? ` · ${Number(sum.score) || 0}/100` : ""}</strong>
+        </div>
+        <div class="prog-hero-stat">
+          <span class="prog-hero-label">Active days</span>
+          <strong>${sum ? Number(sum.active_days) || 0 : 0} of ${p.windowDays}</strong>
+        </div>
+        <div class="prog-hero-stat">
+          <span class="prog-hero-label">Streak at 60+</span>
+          <strong>${sum ? Number(sum.streak) || 0 : 0} day${sum && Number(sum.streak) === 1 ? "" : "s"}</strong>
+        </div>
+      </div>
+    </div>
+    <table class="domain-table prog-math">
+      <tbody>
+        ${math
+          .map(
+            ([label, value, why]) => `
+          <tr><td>${esc(label)}</td><td class="prog-math-value">${esc(value)}</td>
+              <td class="prog-math-why">${esc(why)}</td></tr>`
+          )
+          .join("")}
+      </tbody>
+    </table>
+    <p class="prog-note">Score = 100 × (0.6 × attainment + 0.4 × focus) − penalty, rounded and clamped to 0–100.
+      This grades <strong>the activity against a target</strong>. It is not a grade of the child.
+      ${hasData ? "" : "A day under 5 minutes of counted time reads N/A, never F."}</p>`;
+}
+
+function renderProgressBands() {
+  const el = document.getElementById("progress-bands-card");
+  if (!el) return;
+  const s = (state.progress.day && state.progress.day.score) || null;
+  const head = `
+    <div class="card-header">
+      <div class="card-title">⚖️ How the day was spent</div>
+    </div>`;
+  if (!s || !(Number(s.counted_sec) > 0)) {
+    el.innerHTML = `${head}
+      <div class="empty-state">
+        <div class="icon">⚖️</div>
+        <h3>Nothing counted for this day</h3>
+        <p>Pick another day, or check that the agent is uploading.</p>
+      </div>`;
+    return;
+  }
+  const counted = Number(s.counted_sec) || 0;
+  const parts = PROG_BANDS.map(([key, label, field]) => ({
+    key, label, seconds: Number(s[field]) || 0,
+  })).filter((b) => b.seconds > 0);
+
+  el.innerHTML = `${head}
+    <div class="prog-stack" role="img"
+      aria-label="${esc(parts.map((b) => `${b.label} ${fmtDur(b.seconds)}`).join(", "))}">
+      ${parts
+        .map(
+          (b) => `<span class="prog-stack-seg band-${b.key}"
+            style="width:${((b.seconds / counted) * 100).toFixed(2)}%"
+            title="${esc(`${b.label}: ${fmtDur(b.seconds)}`)}"></span>`
+        )
+        .join("")}
+    </div>
+    <table class="domain-table">
+      <thead><tr><th>Band</th><th>Weight</th><th>Time</th><th>Share</th></tr></thead>
+      <tbody>
+        ${PROG_BANDS.map(([key, label, field]) => {
+          const secs = Number(s[field]) || 0;
+          const w = { academic: "+2", constructive: "+1", neutral: "0", passive: "−1", distraction: "−2" }[key];
+          return `<tr>
+            <td><span class="prog-band band-${key}">${esc(label)}</span></td>
+            <td>${esc(w)}</td>
+            <td>${esc(fmtDur(secs))}</td>
+            <td>${esc(fmtPct((secs / counted) * 100))}</td>
+          </tr>`;
+        }).join("")}
+      </tbody>
+    </table>
+    <p class="prog-note">Browser windows added another
+      <strong>${esc(fmtDur(s.browser_envelope_sec))}</strong> of screen time. That is the same
+      wall-clock time as the Websites and YouTube panels, so it is shown for cross-checking and
+      never counted — counting it would charge the same minute twice.</p>`;
+}
+
+// Hand-built bars: there is no chart library in this bundle and adding one for
+// fourteen rectangles would be the largest dependency in the front end.
+function renderProgressTrend() {
+  const el = document.getElementById("progress-trend-card");
+  if (!el) return;
+  const p = state.progress;
+  const points = p.trend || [];
+  const selected = (p.day && p.day.day) || p.date || progressDayString();
+  const head = `
+    <div class="card-header">
+      <div class="card-title">📈 Last 14 days</div>
+      <span class="prog-daylabel">click a bar to open that day</span>
+    </div>`;
+  if (!points.length) {
+    el.innerHTML = `${head}
+      <div class="empty-state">
+        <div class="icon">📈</div>
+        <h3>No history yet</h3>
+        <p>Each upload from the agent adds to this chart.</p>
+      </div>`;
+    return;
+  }
+  el.innerHTML = `${head}
+    <div class="prog-trend">
+      ${points
+        .map((pt) => {
+          const has = Number(pt.has_data) === 1;
+          const score = has ? Math.max(0, Math.min(100, Number(pt.score) || 0)) : 0;
+          const grade = has ? String(pt.grade || "N/A") : "N/A";
+          const dayNum = String(pt.day || "").slice(8) || "–";
+          const tip = has
+            ? `${pt.day}: ${grade} (${score}/100), ${fmtDur(pt.academic_sec)} academic`
+            : `${pt.day}: no data`;
+          return `<button class="prog-trend-col${pt.day === selected ? " selected" : ""}"
+              data-progress-day="${esc(String(pt.day || ""))}" title="${esc(tip)}">
+              <span class="prog-trend-value">${has ? score : ""}</span>
+              <span class="prog-trend-bar grade-${progGradeKey(grade)}${has ? "" : " nodata"}"
+                style="height:${has ? Math.max(4, score) : 3}%"></span>
+              <span class="prog-trend-day">${esc(dayNum)}</span>
+            </button>`;
+        })
+        .join("")}
+    </div>
+    <p class="prog-note">A bar with no fill is a day with under five minutes of counted
+      activity — reported as N/A rather than as a failing grade.</p>`;
+}
+
+/** One source's category ledger for the selected day. Shares are within-panel. */
+function progLedgerTable(rows) {
+  const list = rows || [];
+  if (!list.length) {
+    return `<p class="prog-empty-line">No activity recorded for this day.</p>`;
+  }
+  const countedTotal = list
+    .filter((r) => r.counted !== false)
+    .reduce((a, r) => a + (Number(r.seconds) || 0), 0);
+  return `
+    <table class="domain-table">
+      <thead><tr><th>Category</th><th>Band</th><th>Time</th><th>Share</th><th>Events</th></tr></thead>
+      <tbody>
+        ${list
+          .map((r) => {
+            const secs = Number(r.seconds) || 0;
+            const bandKey = r.band || progBand(r.weight);
+            const envelope = r.counted === false;
+            const share = countedTotal > 0 && !envelope
+              ? fmtPct((secs / countedTotal) * 100)
+              : "—";
+            return `<tr class="${envelope ? "prog-row-envelope" : ""}">
+              <td>${esc(progCatLabel(r.category))}${envelope ? ` <span class="prog-tag">not counted</span>` : ""}</td>
+              <td><span class="prog-band band-${esc(bandKey)}">${esc(progCatLabel(bandKey))}</span></td>
+              <td>${esc(fmtDur(secs))}</td>
+              <td>${esc(share)}</td>
+              <td>${Number(r.events) || 0}</td>
+            </tr>`;
+          })
+          .join("")}
+      </tbody>
+    </table>
+    <p class="prog-subtotal">Counted in this panel: <strong>${esc(fmtDur(countedTotal))}</strong></p>`;
+}
+
+/** Top items for one source over the summary window. */
+function progTopTable(items, subLabel) {
+  const list = items || [];
+  if (!list.length) {
+    return `<p class="prog-empty-line">Nothing recorded in this window.</p>`;
+  }
+  return `
+    <table class="domain-table">
+      <thead><tr><th>${esc(subLabel)}</th><th>Category</th><th>Time</th><th>Events</th></tr></thead>
+      <tbody>
+        ${list
+          .map(
+            (it) => `<tr>
+            <td class="prog-item-label" title="${esc(String(it.label || ""))}">${esc(String(it.label || "—"))}${it.sub ? `<span class="prog-sub">${esc(String(it.sub))}</span>` : ""}</td>
+            <td><span class="prog-band band-${progBand(it.weight)}">${esc(progCatLabel(it.category))}</span></td>
+            <td>${esc(fmtDur(it.seconds))}</td>
+            <td>${Number(it.events) || 0}</td>
+          </tr>`
+          )
+          .join("")}
+      </tbody>
+    </table>`;
+}
+
+// Three panels, rendered from three separate arrays. There is deliberately no
+// combined table and no grand total here: the shape of the API response keeps
+// the sources apart, and this is the last place that could blend them.
+function renderProgressSources() {
+  const el = document.getElementById("progress-sources");
+  if (!el) return;
+  const p = state.progress;
+  const ledger = (p.day && p.day.ledger) || {};
+  const detail = p.detail || {};
+  const itemLabel = { app: "Application", web: "Website", watch: "Video" };
+  el.innerHTML = PROG_SOURCES.map(
+    ([src, icon, title, note]) => `
+    <div class="card prog-panel">
+      <div class="card-header">
+        <div class="card-title">${icon} ${esc(title)}</div>
+        <span class="prog-daylabel">${esc(src)}_category</span>
+      </div>
+      <p class="prog-note">${esc(note)}</p>
+      ${progLedgerTable(ledger[src])}
+      <div class="prog-subhead">Top ${esc(itemLabel[src].toLowerCase())}s · last ${p.windowDays} days</div>
+      ${progTopTable(detail[src], itemLabel[src])}
+    </div>`
+  ).join("");
+}
+
+function renderProgressEnvelope() {
+  const el = document.getElementById("progress-envelope-card");
+  if (!el) return;
+  const rows = (state.progress.detail && state.progress.detail.browser_envelope) || [];
+  const total = rows.reduce((a, r) => a + (Number(r.seconds) || 0), 0);
+  el.innerHTML = `
+    <div class="card-header">
+      <div class="card-title">🪟 Browser envelope — shown, never counted</div>
+      <span class="prog-daylabel">${esc(fmtDur(total))} over ${state.progress.windowDays} days</span>
+    </div>
+    <p class="prog-note">Time with a browser in the foreground. It is the same wall-clock time
+      the Websites and YouTube panels already account for, so it is excluded from every total and
+      from the grade. Use it as a cross-check: if this is far larger than Websites + YouTube
+      combined, the browser-history collector is missing pages.</p>
+    ${rows.length
+      ? `<table class="domain-table">
+          <thead><tr><th>Browser</th><th>Foreground time</th><th>Sessions</th></tr></thead>
+          <tbody>
+            ${rows
+              .map(
+                (r) => `<tr class="prog-row-envelope">
+                <td>${esc(String(r.label || "—"))} <span class="prog-tag">not counted</span></td>
+                <td>${esc(fmtDur(r.seconds))}</td>
+                <td>${Number(r.events) || 0}</td>
+              </tr>`
+              )
+              .join("")}
+          </tbody>
+        </table>`
+      : `<p class="prog-empty-line">No browser foreground time recorded in this window.</p>`}`;
+}
+
+// ─── AI report card ─────────────────────────────────────────────────────────
+// Two things share this card, and the order is deliberate: the exact payload
+// first, the report second. The privacy claim is the reason a parent lets this
+// feature phone home at all, so it is shown as data rather than as a promise.
+
+/** Why a report came out plainer than usual, in the parent's words. */
+const AI_REASON_TEXT = {
+  no_data: "There is not enough recorded activity yet to write a report about.",
+  not_configured: "Written locally — no AI provider key is configured on the server.",
+  no_fetch: "Written locally — this Node version has no outbound fetch available.",
+  daily_limit: "Written locally — today's AI request budget is already spent.",
+  provider_error: "Written locally — the AI provider could not be reached just now.",
+  unparseable: "Written locally — the AI reply could not be read as a report.",
+};
+
+function progAiList(title, items) {
+  const rows = (Array.isArray(items) ? items : []).filter(Boolean);
+  if (!rows.length) return "";
+  return `<div class="prog-ai-block">
+      <h4 class="prog-ai-head">${esc(title)}</h4>
+      <ul class="prog-ai-list">${rows.map((t) => `<li>${esc(t)}</li>`).join("")}</ul>
+    </div>`;
+}
+
+/**
+ * When a stored report was written.
+ *
+ * SQLite writes CURRENT_TIMESTAMP as "YYYY-MM-DD HH:MM:SS" in UTC with no zone
+ * marker, which Safari parses as local time and Chrome as UTC. Appending the Z
+ * removes the ambiguity; anything unparseable is shown verbatim rather than as
+ * "Invalid Date".
+ */
+function progAiWhen(stamp) {
+  const raw = String(stamp || "").trim();
+  if (!raw) return "";
+  const iso = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(raw) ? `${raw.replace(" ", "T")}Z` : raw;
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return raw;
+  return d.toLocaleString(undefined, {
+    day: "numeric", month: "short", hour: "2-digit", minute: "2-digit",
+  });
+}
+
+function renderProgressAi() {
+  const el = document.getElementById("progress-ai-card");
+  if (!el) return;
+  const p = state.progress;
+  const sum = p.summary;
+  const a = (sum && sum.averages) || null;
+  const st = p.aiStatus || null;
+  const res = p.aiResult || null;
+  const report = (res && res.report) || p.insight || null;
+  const busy = Boolean(p.aiBusy);
+
+  // The provider is optional, so the header states the situation instead of
+  // pretending the button is broken when no key is present.
+  const badge = !st
+    ? "checking provider…"
+    : st.configured
+      ? `${st.model} · ${st.remaining_today}/${st.daily_limit} requests left today`
+      : "no provider key — local report";
+  const reason = res && res.reason ? AI_REASON_TEXT[res.reason] || "Written locally." : "";
+  const written = report && report.created_at
+    ? `Saved ${progAiWhen(report.created_at)}`
+    : res && res.source === "local" ? "Written on this machine" : "";
+
+  el.innerHTML = `
+    <div class="card-header">
+      <div class="card-title">🤖 AI progress report</div>
+      <span class="prog-daylabel">${esc(badge)}</span>
+    </div>
+    <p class="prog-note">The report is written from aggregates only — category names and totals.
+      No screenshot, no full URL and no search term is ever sent.${st && st.send_titles
+        ? " <strong>AI_SEND_TITLES is on:</strong> the top app names, bare domains and video titles are included as well."
+        : " Not even an app name or a domain leaves this machine."} This is the complete payload:</p>
+    ${a
+      ? `<table class="domain-table prog-math">
+          <tbody>
+            <tr><td>Daily average academic</td><td class="prog-math-value">${esc(fmtDur(a.academic_sec))}</td></tr>
+            <tr><td>Daily average constructive</td><td class="prog-math-value">${esc(fmtDur(a.constructive_sec))}</td></tr>
+            <tr><td>Daily average distraction</td><td class="prog-math-value">${esc(fmtDur(a.distraction_sec))}</td></tr>
+            <tr><td>Daily average counted</td><td class="prog-math-value">${esc(fmtDur(a.counted_sec))}</td></tr>
+            <tr><td>Categories per source</td><td class="prog-math-value">${["app", "web", "watch"]
+              .map((s) => `${((sum.by_source || {})[s] || []).length} ${s}`)
+              .join(" · ")}</td></tr>
+          </tbody>
+        </table>`
+      : `<p class="prog-empty-line">No aggregates yet.</p>`}
+    <button class="btn btn-primary" id="progress-ai-btn" style="width:auto"${busy ? " disabled" : ""}
+      title="Sends the payload above and nothing else">${busy ? "Writing report…" : "✨ Generate report"}</button>
+    ${report
+      ? `<div class="prog-ai-report">
+          ${reason ? `<p class="prog-ai-reason">${esc(reason)}</p>` : ""}
+          <p class="prog-ai-summary">${esc(report.summary || "")}</p>
+          ${progAiList("Working well", report.strengths)}
+          ${progAiList("Worth a look", report.focus_areas)}
+          ${progAiList("What to do next", report.next_steps)}
+          <p class="prog-ai-foot">${esc([
+            res && res.cached ? "From cache — the numbers have not changed since this was written" : "",
+            res && res.source === "gemini" ? `Written by ${res.usage ? res.usage.model : "the AI provider"}` : "",
+            written,
+          ].filter(Boolean).join(" · "))}</p>
+        </div>`
+      : `<p class="prog-empty-line">No report yet. The button writes one from the payload above —
+          with a provider key it is written by ${esc(st ? st.model : "the AI model")}, without one it is
+          written here from the same numbers.</p>`}`;
+}
+
+function renderProgressGoals() {
+  const el = document.getElementById("progress-goals-card");
+  if (!el) return;
+  const g = state.progress.goals;
+  const min = g ? Number(g.daily_academic_min) || 60 : 60;
+  const wk = g ? Number(g.weekly_target_days) || 5 : 5;
+  el.innerHTML = `
+    <div class="card-header">
+      <div class="card-title">🎯 Daily goal</div>
+    </div>
+    <p class="prog-note">Changing the target re-scores every stored day at once, so the trend
+      chart never compares yesterday's 60-minute grade with today's 90-minute one.</p>
+    <div class="prog-form-row">
+      <label class="prog-field">
+        <span>Academic minutes per day</span>
+        <input class="form-input" type="number" id="progress-goal-min" min="5" max="720" value="${min}" />
+      </label>
+      <label class="prog-field">
+        <span>Target days per week</span>
+        <input class="form-input" type="number" id="progress-goal-days" min="1" max="7" value="${wk}" />
+      </label>
+      <button class="btn btn-primary" id="progress-goal-save" style="width:auto">Save goal</button>
+    </div>
+    <div class="prog-danger">
+      <strong>Erase progress history</strong>
+      <p>Deletes this child's stored app, browser and YouTube history along with every grade
+        derived from it. This cannot be undone.</p>
+      <button class="btn btn-danger btn-sm" id="progress-erase-btn">Erase all progress history</button>
+    </div>`;
+}
+
+// The override editor. The category dropdown is rebuilt from the selected
+// source's own taxonomy, so the UI cannot even offer a web category for an app
+// rule — the same rule the server enforces, made visible instead of just
+// rejected after the fact.
+function renderProgressRules() {
+  const el = document.getElementById("progress-rules-card");
+  if (!el) return;
+  const p = state.progress;
+  const data = p.rules;
+  const tables = (data && data.categories) || (p.rubric && p.rubric.categories) || {};
+  const src = tables[p.ruleSource] ? p.ruleSource : "app";
+  p.ruleSource = src;
+  const cats = Object.keys(tables[src] || {});
+  const rules = (data && data.rules) || [];
+  const matchTypes = (data && data.match_types) || ["contains", "domain", "exact"];
+
+  el.innerHTML = `
+    <div class="card-header">
+      <div class="card-title">🏷️ Category overrides</div>
+      <span class="prog-daylabel">${rules.length} rule${rules.length === 1 ? "" : "s"}</span>
+    </div>
+    <p class="prog-note">Reclassify something the built-in rules got wrong. A rule belongs to one
+      source and can only use that source's categories. The weight comes from the category, so a
+      rule can never invent a score. Press Recalculate afterwards to re-apply it to history.</p>
+    <div class="prog-form-row">
+      <label class="prog-field">
+        <span>Source</span>
+        <select class="form-input" id="progress-rule-source">
+          ${["app", "web", "watch"]
+            .map((s) => `<option value="${s}"${s === src ? " selected" : ""}>${s}</option>`)
+            .join("")}
+        </select>
+      </label>
+      <label class="prog-field">
+        <span>Match</span>
+        <select class="form-input" id="progress-rule-match">
+          ${matchTypes
+            .map((m) => `<option value="${esc(String(m))}"${m === "contains" ? " selected" : ""}>${esc(String(m))}</option>`)
+            .join("")}
+        </select>
+      </label>
+      <label class="prog-field prog-field-wide">
+        <span>Pattern (3+ characters)</span>
+        <input class="form-input" type="text" id="progress-rule-value"
+          placeholder="${src === "app" ? "thonny" : src === "web" ? "example.com" : "chapter 4"}" />
+      </label>
+      <label class="prog-field">
+        <span>Category (${esc(src)})</span>
+        <select class="form-input" id="progress-rule-category">
+          ${cats.map((c) => `<option value="${esc(c)}">${esc(progCatLabel(c))} (${tables[src][c] > 0 ? "+" : ""}${tables[src][c]})</option>`).join("")}
+        </select>
+      </label>
+      <button class="btn btn-primary" id="progress-rule-add" style="width:auto">+ Add rule</button>
+    </div>
+    ${rules.length
+      ? `<table class="domain-table">
+          <thead><tr><th>Source</th><th>Match</th><th>Pattern</th><th>Category</th><th>Weight</th><th>Origin</th><th></th></tr></thead>
+          <tbody>
+            ${rules
+              .map(
+                (r) => `<tr>
+                <td>${esc(String(r.source))}</td>
+                <td>${esc(String(r.match_type))}</td>
+                <td>${esc(String(r.match_value))}</td>
+                <td><span class="prog-band band-${progBand(r.academic_weight)}">${esc(progCatLabel(r.category))}</span></td>
+                <td>${Number(r.academic_weight) > 0 ? "+" : ""}${Number(r.academic_weight) || 0}</td>
+                <td>${esc(String(r.origin || "seed"))}</td>
+                <td><button class="btn btn-danger btn-sm" data-progress-rule-del="${Number(r.id)}">Delete</button></td>
+              </tr>`
+              )
+              .join("")}
+          </tbody>
+        </table>`
+      : `<p class="prog-empty-line">No overrides yet — every category comes from the built-in rules.</p>`}`;
+}
+
 function renderRulesPage() {
   const list = document.getElementById("rules-blocklist-list");
   const count = document.getElementById("rules-total-count");
@@ -1829,8 +2608,27 @@ function renderAlertsPage() {
 
 // ─── Navigation ─────────────────────────────────────────────────────────────
 
+// ─── Page routing ───────────────────────────────────────────────────────────
+// The URL hash names the page, so the dashboard can be opened straight onto one:
+// GUARD.bat's "Academic Progress" option and, later, an alert link both need to
+// land somewhere specific rather than on whatever page happens to be default.
+
+const PAGES = ["live", "devices", "apps", "progress", "blocklist", "rules", "alerts"];
+
+/** The page named by the current URL hash, or null if it names nothing valid. */
+function pageFromHash() {
+  const raw = String(window.location.hash || "").replace(/^#\/?/, "").trim().toLowerCase();
+  return PAGES.includes(raw) ? raw : null;
+}
+
 function navigateTo(page) {
   state.currentPage = page;
+
+  // Reflect the page in the URL, but only when it differs — assigning the same
+  // hash is a no-op in some browsers and a spurious hashchange in others.
+  if (PAGES.includes(page) && pageFromHash() !== page) {
+    window.location.hash = page;
+  }
 
   // Update nav items
   document.querySelectorAll(".nav-item[data-page]").forEach((el) => {
@@ -1847,6 +2645,7 @@ function navigateTo(page) {
     live: "Live View",
     devices: "Devices",
     apps: "Application Tracking & Control",
+    progress: "Academic Progress",
     blocklist: "Blocklist",
     rules: "Rules & Limits",
     alerts: "Alerts",
@@ -1871,6 +2670,11 @@ function navigateTo(page) {
   }
   if (page === "alerts") loadAlerts();
   if (page === "devices") renderDevicesList();
+  if (page === "progress") {
+    renderProgressPage();
+    loadProgress();
+    loadProgressRules();
+  }
   if (page === "live") {
     pushStreamConfig(true);
     loadDeviceTelemetry(state.selectedDeviceId);
@@ -1927,6 +2731,13 @@ function attachDashboardEvents() {
   // Navigation
   document.querySelectorAll(".nav-item[data-page]").forEach((el) => {
     el.addEventListener("click", () => navigateTo(el.dataset.page));
+  });
+
+  // Back/forward and externally-opened deep links (GUARD.bat opens #progress).
+  // Guarded on inequality so navigateTo's own hash write cannot loop.
+  window.addEventListener("hashchange", () => {
+    const page = pageFromHash();
+    if (page && page !== state.currentPage) navigateTo(page);
   });
 
   // Logout
@@ -2331,6 +3142,212 @@ function attachDashboardEvents() {
     if (refreshRunningBtn) {
       loadAppsOverview();
       showToast("Refreshed running processes", "info");
+    }
+
+    // ─── Academic Progress ──────────────────────────────────────────────────
+    // Appended to this existing delegated listener rather than a new one: every
+    // control on the Progress page is written by innerHTML and would lose a
+    // directly-bound handler on each re-render.
+
+    const shiftBtn = e.target.closest("[data-progress-shift]");
+    if (shiftBtn) {
+      progShiftDate(parseInt(shiftBtn.dataset.progressShift, 10) || 0);
+      return;
+    }
+
+    const trendCol = e.target.closest("[data-progress-day]");
+    if (trendCol) {
+      const day = trendCol.dataset.progressDay;
+      if (day) {
+        state.progress.date = day;
+        loadProgress();
+      }
+      return;
+    }
+
+    if (e.target.closest("#progress-refresh-btn")) {
+      loadProgress();
+      loadProgressRules();
+      return;
+    }
+
+    const aiBtn = e.target.closest("#progress-ai-btn");
+    if (aiBtn) {
+      const deviceId = progressDeviceId();
+      if (!deviceId) {
+        showToast("No device selected", "warning");
+        return;
+      }
+      // force:true is safe to send on every click — the server still answers from
+      // cache when the aggregates have not moved, and a parent who clicks twice
+      // expects a fresh attempt rather than the same cached paragraph.
+      const p = state.progress;
+      p.aiBusy = true;
+      renderProgressAi();
+      api(`/progress/${deviceId}/analyze`, {
+        method: "POST",
+        body: JSON.stringify({ days: p.windowDays, force: "true" }),
+      })
+        .then((r) => {
+          if (!r) return;
+          p.aiResult = r;
+          if (r.source === "gemini" && r.report) p.insight = r.report;
+          const note = r.reason ? AI_REASON_TEXT[r.reason] || "Report written locally" : null;
+          showToast(note || (r.cached ? "Report unchanged — served from cache" : "Report written"),
+            r.reason && r.reason !== "no_data" ? "warning" : "success");
+        })
+        .catch((err) => showToast(err.message, "error"))
+        .finally(() => {
+          p.aiBusy = false;
+          renderProgressAi();
+        });
+      return;
+    }
+
+    const rebuildBtn = e.target.closest("#progress-rebuild-btn");
+    if (rebuildBtn) {
+      const deviceId = progressDeviceId();
+      if (!deviceId) {
+        showToast("No device to recalculate", "warning");
+        return;
+      }
+      rebuildBtn.disabled = true;
+      rebuildBtn.textContent = "Recalculating…";
+      api(`/progress/${deviceId}/rebuild`, {
+        method: "POST",
+        body: JSON.stringify({ days: 60 }),
+      })
+        .then((r) => {
+          showToast(
+            r ? `Reclassified ${r.rows || 0} records across ${r.rolled || 0} days` : "Recalculated",
+            "success"
+          );
+          loadProgress();
+        })
+        .catch((err) => showToast(err.message, "error"))
+        .finally(() => {
+          rebuildBtn.disabled = false;
+          rebuildBtn.textContent = "♻️ Recalculate";
+        });
+      return;
+    }
+
+    const goalSave = e.target.closest("#progress-goal-save");
+    if (goalSave) {
+      const deviceId = progressDeviceId();
+      const minEl = document.getElementById("progress-goal-min");
+      const daysEl = document.getElementById("progress-goal-days");
+      const min = parseInt(minEl?.value, 10);
+      if (!deviceId) {
+        showToast("No device selected", "warning");
+        return;
+      }
+      if (!Number.isFinite(min) || min < 5 || min > 720) {
+        showToast("Daily target must be between 5 and 720 minutes", "warning");
+        return;
+      }
+      api(`/progress/${deviceId}/goals`, {
+        method: "PUT",
+        body: JSON.stringify({
+          daily_academic_min: min,
+          weekly_target_days: parseInt(daysEl?.value, 10) || 5,
+        }),
+      })
+        .then((r) => {
+          showToast(`Goal saved — ${r ? r.rescored || 0 : 0} stored days re-scored`, "success");
+          loadProgress();
+        })
+        .catch((err) => showToast(err.message, "error"));
+      return;
+    }
+
+    const eraseBtn = e.target.closest("#progress-erase-btn");
+    if (eraseBtn) {
+      const deviceId = progressDeviceId();
+      if (!deviceId) return;
+      // Two barriers on purpose: this deletes a child's history and every grade
+      // built from it, and the server also demands confirm:"DELETE".
+      if (!window.confirm("Erase ALL stored progress history for this device? This cannot be undone.")) return;
+      api(`/progress/${deviceId}/history`, {
+        method: "DELETE",
+        body: JSON.stringify({ confirm: "DELETE" }),
+      })
+        .then((r) => {
+          const d = (r && r.deleted) || {};
+          showToast(
+            `Erased ${d.usage_sessions || 0} app sessions and ${d.web_visits || 0} page visits`,
+            "success"
+          );
+          loadProgress();
+        })
+        .catch((err) => showToast(err.message, "error"));
+      return;
+    }
+
+    const ruleAdd = e.target.closest("#progress-rule-add");
+    if (ruleAdd) {
+      const source = document.getElementById("progress-rule-source")?.value || "app";
+      const matchType = document.getElementById("progress-rule-match")?.value || "contains";
+      const valueEl = document.getElementById("progress-rule-value");
+      const category = document.getElementById("progress-rule-category")?.value || "";
+      const value = String(valueEl?.value || "").trim();
+      if (value.length < 3) {
+        // Short patterns match half the system — the BUG-13 lesson, caught here
+        // too so the parent gets the reason instead of a 400.
+        showToast("Pattern must be at least 3 characters", "warning");
+        return;
+      }
+      api("/progress/rules", {
+        method: "POST",
+        body: JSON.stringify({ source, match_type: matchType, match_value: value, category }),
+      })
+        .then(() => {
+          if (valueEl) valueEl.value = "";
+          showToast(`Rule saved — press Recalculate to apply it to history`, "success");
+          loadProgressRules();
+        })
+        .catch((err) => showToast(err.message, "error"));
+      return;
+    }
+
+    const ruleDel = e.target.closest("[data-progress-rule-del]");
+    if (ruleDel) {
+      api(`/progress/rules/${ruleDel.dataset.progressRuleDel}`, { method: "DELETE" })
+        .then(() => {
+          showToast("Rule deleted — press Recalculate to re-apply the defaults", "success");
+          loadProgressRules();
+        })
+        .catch((err) => showToast(err.message, "error"));
+    }
+  });
+
+  // Progress page selects and the date field. `change` has no existing delegated
+  // listener, and these controls are replaced by innerHTML on every render, so
+  // delegation is the only binding that survives.
+  document.addEventListener("change", (e) => {
+    const deviceSel = e.target.closest("#progress-device");
+    if (deviceSel) {
+      state.progress.deviceId = parseInt(deviceSel.value, 10) || null;
+      loadProgress();
+      return;
+    }
+    const dateInput = e.target.closest("#progress-date");
+    if (dateInput) {
+      state.progress.date = dateInput.value || null;
+      loadProgress();
+      return;
+    }
+    const windowSel = e.target.closest("#progress-window");
+    if (windowSel) {
+      state.progress.windowDays = parseInt(windowSel.value, 10) || 7;
+      loadProgress();
+      return;
+    }
+    const ruleSrc = e.target.closest("#progress-rule-source");
+    if (ruleSrc) {
+      // Re-render so the category list belongs to the newly chosen taxonomy.
+      state.progress.ruleSource = ruleSrc.value;
+      renderProgressRules();
     }
   });
 

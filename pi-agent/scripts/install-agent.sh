@@ -56,6 +56,14 @@ apt-get install -y -qq \
     2>/dev/null
 log "System packages installed"
 
+# Academic-progress accuracy, installed separately so a missing package in one
+# Pi OS release cannot fail the whole apt line above. The progress collectors
+# work without it — they just count wall-clock time instead of trimming the
+# minutes the child was away from the machine.
+apt-get install -y -qq xprintidle 2>/dev/null \
+    && log "Idle detection installed (academic time will be idle-trimmed)" \
+    || warn "xprintidle unavailable — academic time counts wall-clock minutes"
+
 # ── 2. Copy agent files ──────────────────────────────────────
 info "Installing agent to $INSTALL_DIR..."
 mkdir -p "$INSTALL_DIR"

@@ -6,9 +6,43 @@
 const express = require("express");
 const db = require("../models/db");
 const { authMiddleware } = require("./auth");
+const telegram = require("../services/telegram");
 
 const router = express.Router();
 router.use(authMiddleware);
+
+/**
+ * GET /api/alerts/telegram/status
+ * Is the phone channel wired up? Booleans and counts only — the bot token never
+ * leaves the server, so the browser learns "configured", never the credential.
+ */
+router.get("/telegram/status", (req, res) => {
+  res.json(telegram.status());
+});
+
+/**
+ * POST /api/alerts/telegram/test
+ * Send a "GUARDIAN connected" message so the parent can confirm the chat works.
+ * Deliberately bypasses the dedupe ledger and the hourly cap (this message was
+ * explicitly asked for), so it is throttled here instead — one test per 10s,
+ * which is plenty for a settings screen and useless as a spam vector.
+ */
+let lastTestAt = 0;
+router.post("/telegram/test", async (req, res) => {
+  const now = Date.now();
+  if (now - lastTestAt < 10000) {
+    return res.status(429).json({
+      ok: false,
+      error: "Give it a few seconds before testing again.",
+    });
+  }
+  lastTestAt = now;
+  const outcome = await telegram.selfTest();
+  res.status(outcome.ok ? 200 : 400).json({
+    ok: outcome.ok,
+    error: outcome.ok ? null : outcome.detail,
+  });
+});
 
 /**
  * GET /api/alerts?limit=50&device_id=1

@@ -46,6 +46,12 @@ windows-app/.live-agent-venv/
 **/screenshots/
 **/captures/
 
+# SSH data pulls (TRANSFER-DATA.bat / GUARD.bat datapull). These folders are the
+# child's actual browsing, app and YouTube records copied off the Pi — the most
+# sensitive data this project handles. They must never reach a remote.
+data-exports/
+**/guardian-export-*.tar.gz
+
 # OS/editor files
 .DS_Store
 Thumbs.db

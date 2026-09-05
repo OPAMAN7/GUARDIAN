@@ -16,10 +16,11 @@ import shutil
 import socket
 import subprocess
 import sys
+import tarfile
 import time
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Dict, List, Optional, Tuple
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -41,6 +42,15 @@ WINDOWS_AGENT_CONFIG = ROOT_DIR / "windows-app" / "config" / "local-agent-config
 WEB_DIR = ROOT_DIR / "parent-dashboard" / "web-ts"
 WEB_DIST = WEB_DIR / "dist"
 WEB_SOURCE_GLOBS = ("*.js", "*.ts", "*.css", "*.html", "*.json")
+
+# Server-side secrets (Gemini key, Telegram bot token) live here and nowhere else.
+# The file is gitignored on purpose: it must never reach GitHub, and nothing in it
+# is ever bundled into the browser build.
+SERVER_ENV_PATH = ROOT_DIR / "parent-dashboard" / "server-ts" / ".env"
+
+# Where an SSH data pull lands. One timestamped folder per run, never overwritten,
+# so two pulls can be compared when something looks wrong.
+DATA_EXPORT_DIR = ROOT_DIR / "data-exports"
 
 DEFAULTS = {
     "pi_hostname": "aman-test",
@@ -64,6 +74,7 @@ STATUS = {
     "windows_agent": False,
     "pi_agent": False,
     "recalibrated": False,
+    "data_pulled": False,
 }
 
 AUTO_REDIRECT_DONE = False
@@ -104,6 +115,24 @@ def status_tag(done: bool) -> str:
     return C.DIM + "[....]" + C.RESET
 
 
+def _telegram_tag() -> str:
+    """Menu badge for the Telegram channel, read live from server-ts/.env."""
+    try:
+        has_token, has_chat, enabled = telegram_state()
+    except Exception:
+        return C.DIM + "[TG  ]" + C.RESET
+    if has_token and has_chat:
+        return (C.GREEN + "[TG ON]" + C.RESET) if enabled else (C.YELLOW + "[TG MUTE]" + C.RESET)
+    return C.DIM + "[TG OFF]" + C.RESET
+
+
+def _datapull_tag() -> str:
+    """Menu badge for the SSH data pull — green once one has run this session."""
+    if STATUS["data_pulled"]:
+        return C.GREEN + "[PULL ✓]" + C.RESET
+    return C.BLUE + "[PULL]" + C.RESET
+
+
 def draw_menu(cfg: Dict[str, str]) -> None:
     print_banner()
     print(f" {status_tag(STATUS['dashboard'])} 1. Launch Dashboard Core")
@@ -114,6 +143,9 @@ def draw_menu(cfg: Dict[str, str]) -> None:
     print(f" {C.GREEN}[PUSH]{C.RESET} D. Deploy Pi Agent (upload all files + run)")
     print(f" {C.BLUE}[CFG ]{C.RESET} I. Set Server IP (source of truth)")
     print(f" {C.BLUE}[OPEN]{C.RESET} 6. Open Dashboard (localhost)")
+    print(f" {C.GREEN}[GRADE]{C.RESET} A. Open Academic Progress (app + web + YouTube grading)")
+    print(f" {_telegram_tag()} M. Connect Telegram Alerts (phone notifications)")
+    print(f" {_datapull_tag()} P. Pull Device Data via SSH (progress spool + logs)")
     print(f" {C.BLUE}[INFO]{C.RESET} 7. Show Network Report")
     print(f" {C.YELLOW}[DIAG]{C.RESET} T. Troubleshoot Pi (status + agent log)")
     print(f" {C.BLUE}[CFG ]{C.RESET} 8. Update Pi Hostname/User")
@@ -549,6 +581,41 @@ def scp_push(cfg: Dict[str, str], ip: str, local_paths: List[str],
         return subprocess.run(cmd, timeout=timeout).returncode
     except subprocess.TimeoutExpired:
         print(C.RED + f"Upload timed out after {timeout}s ({ip})." + C.RESET)
+        return 124
+    except OSError as exc:
+        print(C.RED + f"scp failed to launch: {exc}" + C.RESET)
+        return 127
+
+
+def scp_pull(cfg: Dict[str, str], ip: str, remote_paths: List[str],
+             local_dir: str, timeout: int = 600) -> int:
+    """
+    Download from the Pi. The mirror image of scp_push, using the same three-way
+    fallback (pscp with the stored password, sshpass, then plain scp which will
+    prompt) so a data pull works on exactly the machines a deploy works on.
+
+    Remote paths are quoted for the remote shell but the LOCAL destination is
+    passed as a separate argv entry, never string-concatenated — a Windows path
+    with a space in it is otherwise silently split into two arguments.
+    """
+    user = cfg["pi_username"]
+    pw = _ssh_password(cfg)
+    sources = [f"{user}@{ip}:{p}" for p in remote_paths]
+    Path(local_dir).mkdir(parents=True, exist_ok=True)
+    _prime_host_key(cfg, ip)
+    try:
+        if pw and shutil.which("pscp"):
+            cmd = ["pscp", "-batch", "-pw", pw, "-r", *sources, local_dir]
+            return subprocess.run(cmd, timeout=timeout).returncode
+        if pw and shutil.which("sshpass"):
+            cmd = ["sshpass", "-p", pw, "scp",
+                   "-o", "StrictHostKeyChecking=accept-new",
+                   "-o", "ConnectTimeout=8", "-r", *sources, local_dir]
+            return subprocess.run(cmd, timeout=timeout).returncode
+        cmd = ["scp", "-o", "ConnectTimeout=8", "-r", *sources, local_dir]
+        return subprocess.run(cmd, timeout=timeout).returncode
+    except subprocess.TimeoutExpired:
+        print(C.RED + f"Download timed out after {timeout}s ({ip})." + C.RESET)
         return 124
     except OSError as exc:
         print(C.RED + f"scp failed to launch: {exc}" + C.RESET)
@@ -1240,6 +1307,33 @@ def action_launch_dashboard() -> None:
     STATUS["dashboard"] = ok
 
 
+def action_open_progress(cfg: Dict[str, str]) -> None:
+    """Open the dashboard directly on the Academic Progress page.
+
+    Academic progress is a standard part of the product, so it gets a first-class
+    entry here rather than living behind "open the dashboard and go find a tab".
+    The bundle check is not optional: the browser serves web-ts/dist, so on a
+    stale bundle this page would simply not exist and the menu would appear to do
+    nothing (BUG-29).
+    """
+    port = cfg.get("server_port", "3000")
+    print_web_bundle_line()
+    state, _ = web_bundle_state()
+    if state not in ("fresh", "nosrc"):
+        print(C.YELLOW + "Building the dashboard UI first so the Progress page "
+              "exists in the bundle..." + C.RESET)
+        build_web_dashboard(quiet=False)
+    if not tcp_open("127.0.0.1", int(port), 1.0):
+        print(C.YELLOW + f"Nothing is listening on port {port} — start the "
+              "dashboard with option 1 first." + C.RESET)
+        return
+    url = f"http://localhost:{port}/#progress"
+    print(C.GREEN + f"Opening {url}" + C.RESET)
+    print(C.DIM + "Grades need uploaded activity: the Pi agent ships app, browser "
+          "and YouTube history on a 30s cadence once it is running." + C.RESET)
+    webbrowser.open(url)
+
+
 def action_launch_windows_agent() -> None:
     boot_sequence("WINDOWS AGENT", [
         "Load local control profile",
@@ -1297,6 +1391,21 @@ def _diag_probe(install: str, svc: str) -> str:
         "| grep -c 'returned no frame' || true)",
         "echo -n 'SERVER_URL='; sudo -n grep -o '\"server_url\"[^,]*' "
         + shlex.quote(install + "/config.json") + " 2>/dev/null || echo '(no config.json)'",
+        # Academic progress is part of the standard install, so the probe reports
+        # it like every other core subsystem rather than leaving it invisible:
+        # are the three collector modules there, is the flag on, did the
+        # collectors actually start, and is anything stuck in the spool.
+        f"echo PROGRESS_FILES=$(ls {shlex.quote(install + '/usage_tracker.py')} "
+        f"{shlex.quote(install + '/browser_history.py')} {shlex.quote(install + '/spool.py')} "
+        "2>/dev/null | wc -l)/3",
+        "echo -n 'PROGRESS_CFG='; sudo -n grep -o '\"enable_progress_tracking\"[^,]*' "
+        + shlex.quote(install + "/config.json") + " 2>/dev/null || echo '(key absent - defaults to on)'",
+        f"echo PROGRESS_READY=$(journalctl -u {shlex.quote(svc)} -n 400 --no-pager 2>/dev/null "
+        "| grep -c 'progress collectors ready' || true)",
+        "echo PROGRESS_QUEUED=$(sudo -n cat /root/.guardian-shield/progress/*.jsonl "
+        "2>/dev/null | wc -l)",
+        "echo XPRINTIDLE=$(command -v xprintidle >/dev/null && echo yes "
+        "|| echo 'no - academic time not idle-trimmed')",
     ])
 
 
@@ -1415,9 +1524,557 @@ def action_update_target(cfg: Dict[str, str]) -> None:
     print(C.GREEN + "Pi target settings saved." + C.RESET)
 
 
+# ─── Telegram alerts ─────────────────────────────────────────────────────────
+# The parent's phone channel. Credentials are written into server-ts/.env, which
+# is gitignored and read only by the Node server — deliberately NOT into
+# guard_runtime.json, because that file is a plain runtime config that gets opened,
+# copied and pasted into chats when something breaks, and because load_cfg() would
+# need a DEFAULTS entry for every key (a silent-drop trap). One secret, one home.
+
+
+def _env_lines() -> List[str]:
+    if not SERVER_ENV_PATH.exists():
+        return []
+    try:
+        return SERVER_ENV_PATH.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return []
+
+
+def read_server_env() -> Dict[str, str]:
+    """Parse server-ts/.env into a dict. Comments and blank lines are ignored."""
+    out: Dict[str, str] = {}
+    for line in _env_lines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, _, value = stripped.partition("=")
+        out[key.strip()] = value.strip()
+    return out
+
+
+def upsert_server_env(updates: Dict[str, str], header: str = "") -> None:
+    """
+    Set keys in server-ts/.env, rewriting a key in place if it is already there and
+    appending the rest. Existing lines, comments and order are preserved: this file
+    also holds JWT_SECRET and the admin password, so it is edited surgically and
+    never regenerated from a template.
+    """
+    lines = _env_lines()
+    remaining = dict(updates)
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key = stripped.partition("=")[0].strip()
+        if key in remaining:
+            lines[idx] = f"{key}={remaining.pop(key)}"
+
+    if remaining:
+        if lines and lines[-1].strip():
+            lines.append("")
+        if header:
+            lines.append(header)
+        for key, value in remaining.items():
+            lines.append(f"{key}={value}")
+
+    SERVER_ENV_PATH.parent.mkdir(parents=True, exist_ok=True)
+    # newline="\n" via open() rather than Path.write_text(newline=...), which only
+    # gained the newline argument on Python 3.10; dotenv is happy with LF on Windows.
+    with open(SERVER_ENV_PATH, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+
+def mask_secret(value: str) -> str:
+    """Enough to recognise a key, never enough to use it."""
+    if not value:
+        return "(not set)"
+    if len(value) <= 8:
+        return "*" * len(value)
+    return f"{value[:4]}…{value[-3:]} ({len(value)} chars)"
+
+
+def telegram_state() -> Tuple[bool, bool, bool]:
+    """(has token, has chat id, alerts enabled) straight from server-ts/.env."""
+    env = read_server_env()
+    enabled = str(env.get("TELEGRAM_ALERTS", "true")).strip().lower() != "false"
+    return bool(env.get("TELEGRAM_BOT_TOKEN")), bool(env.get("TELEGRAM_CHAT_ID")), enabled
+
+
+def telegram_api(token: str, method: str, payload: Optional[dict] = None,
+                 timeout: float = 12.0) -> Tuple[bool, dict, str]:
+    """
+    One call to the Bot API from GUARD itself, so a token can be verified without
+    starting the dashboard. Returns (ok, result, detail) and never raises; the
+    error text never includes the URL, because the URL carries the token.
+    """
+    import urllib.request
+    import urllib.error
+
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    data = json.dumps(payload or {}).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:
+        try:
+            body = json.loads(exc.read().decode("utf-8", "replace"))
+        except Exception:
+            return False, {}, f"Telegram said HTTP {exc.code}"
+        return False, {}, str(body.get("description") or f"HTTP {exc.code}")
+    except urllib.error.URLError as exc:
+        return False, {}, f"cannot reach Telegram ({exc.reason})"
+    except Exception as exc:  # timeouts, bad JSON, anything else
+        return False, {}, f"call failed ({type(exc).__name__})"
+
+    if not body.get("ok"):
+        return False, {}, str(body.get("description") or "Telegram refused the call")
+    return True, body.get("result") or {}, ""
+
+
+def discover_chat_ids(token: str) -> List[Tuple[str, str]]:
+    """
+    Read the bot's pending updates and pull out every chat that has messaged it.
+    This exists so the parent never has to hunt for a numeric chat id: send the bot
+    any message from the phone, come back here, and the id is found automatically.
+    """
+    ok, result, _detail = telegram_api(token, "getUpdates", {"limit": 20, "timeout": 0})
+    if not ok or not isinstance(result, list):
+        return []
+    found: Dict[str, str] = {}
+    for update in result:
+        for key in ("message", "edited_message", "channel_post", "my_chat_member"):
+            chat = ((update.get(key) or {}).get("chat")) or {}
+            cid = chat.get("id")
+            if cid is None:
+                continue
+            label = chat.get("title") or " ".join(
+                filter(None, [chat.get("first_name"), chat.get("last_name")])
+            ) or chat.get("username") or chat.get("type") or "chat"
+            found[str(cid)] = str(label)
+    return list(found.items())
+
+
+def print_telegram_help() -> None:
+    print(C.DIM + "  How to get the two values (one-time, about two minutes):" + C.RESET)
+    print(C.DIM + "   1. In Telegram, open @BotFather -> /newbot -> pick any name." + C.RESET)
+    print(C.DIM + "      BotFather replies with a token like 7712345678:AAF..." + C.RESET)
+    print(C.DIM + "   2. Open YOUR new bot and send it any message (say 'hi')." + C.RESET)
+    print(C.DIM + "      That is what lets GUARD find your chat id by itself." + C.RESET)
+    print()
+
+
+def action_telegram(cfg: Dict[str, str]) -> None:
+    """Connect (or re-test, or mute) the Telegram alert channel."""
+    print(C.BLUE + C.BOLD + "Connect Telegram alerts" + C.RESET)
+    print(C.DIM + "Device alerts (malware, blocked site, app timer, blocked app) get" + C.RESET)
+    print(C.DIM + "pushed to your phone. Credentials are stored server-side only, in" + C.RESET)
+    print(C.DIM + f"{SERVER_ENV_PATH.name} — gitignored, never sent to the browser." + C.RESET)
+    print()
+
+    env = read_server_env()
+    token = env.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = env.get("TELEGRAM_CHAT_ID", "")
+    has_token, has_chat, enabled = telegram_state()
+
+    print(f"  Current bot token : {mask_secret(token)}")
+    print(f"  Current chat id   : {chat_id or '(not set)'}")
+    print(f"  Alerts            : {'ENABLED' if enabled else 'MUTED (TELEGRAM_ALERTS=false)'}")
+    print()
+
+    if has_token and has_chat:
+        print(" 1. Send a test message now")
+        print(" 2. Replace the token / chat id")
+        print(" 3. " + ("Mute alerts" if enabled else "Un-mute alerts"))
+        print(" 0. Back")
+        pick = input(C.BOLD + "Choose: " + C.RESET).strip()
+        if pick == "0" or pick == "":
+            return
+        if pick == "1":
+            _telegram_send_test(token, chat_id)
+            return
+        if pick == "3":
+            upsert_server_env({"TELEGRAM_ALERTS": "false" if enabled else "true"})
+            print(C.GREEN + ("Alerts muted." if enabled else "Alerts un-muted.") + C.RESET)
+            print(C.YELLOW + "Restart the dashboard (option 1) for this to take effect." + C.RESET)
+            return
+        # pick == "2" falls through to the setup prompts below.
+
+    print_telegram_help()
+    entered = input("Bot token from @BotFather (blank = keep current): ").strip()
+    if entered:
+        token = entered
+    if not token:
+        print(C.RED + "No token, nothing to save." + C.RESET)
+        return
+    if ":" not in token or len(token) < 20:
+        print(C.RED + "That does not look like a bot token (expected 123456:AA...)." + C.RESET)
+        print(C.DIM + "Copy the whole line BotFather sent, including the digits before the colon." + C.RESET)
+        return
+
+    ok, me, detail = telegram_api(token, "getMe")
+    if not ok:
+        print(C.RED + f"Telegram rejected that token: {detail}" + C.RESET)
+        print(C.DIM + "Nothing was saved. Check the token and try again." + C.RESET)
+        return
+    bot_name = me.get("username") or me.get("first_name") or "bot"
+    print(C.GREEN + f"Token accepted — bot is @{bot_name}" + C.RESET)
+
+    entered_chat = input(f"Chat id (blank = find it automatically) [{chat_id or 'none'}]: ").strip()
+    if entered_chat:
+        chat_id = entered_chat
+    else:
+        print(C.DIM + f"  Looking for chats that have messaged @{bot_name}..." + C.RESET)
+        found = discover_chat_ids(token)
+        if not found:
+            print(C.YELLOW + "  No messages found yet." + C.RESET)
+            print(C.DIM + f"  Open @{bot_name} in Telegram, send it 'hi', then run this option again." + C.RESET)
+            if not chat_id:
+                print(C.DIM + "  The token was NOT saved, so nothing is half-configured." + C.RESET)
+                return
+        elif len(found) == 1:
+            chat_id, label = found[0]
+            print(C.GREEN + f"  Found: {label} -> {chat_id}" + C.RESET)
+        else:
+            for i, (cid, label) in enumerate(found, start=1):
+                print(f"   {i}. {label} -> {cid}")
+            sel = input("  Which chat should get the alerts? [1]: ").strip() or "1"
+            if not sel.isdigit() or not 1 <= int(sel) <= len(found):
+                print(C.RED + "  Not a listed choice — nothing saved." + C.RESET)
+                return
+            chat_id = found[int(sel) - 1][0]
+
+    upsert_server_env(
+        {
+            "TELEGRAM_BOT_TOKEN": token,
+            "TELEGRAM_CHAT_ID": chat_id,
+            "TELEGRAM_ALERTS": "true",
+            "TELEGRAM_MAX_PER_HOUR": env.get("TELEGRAM_MAX_PER_HOUR", "20"),
+        },
+        header=(
+            "# ─── Telegram alerts ────────────────────────────────────────────────────\n"
+            "# Written by GUARD (option M). Server-side only; this file is gitignored and\n"
+            "# nothing here is ever bundled into the browser. TELEGRAM_ALERTS=false mutes\n"
+            "# the channel while keeping the credentials. TELEGRAM_ALERT_TYPES can hold a\n"
+            "# comma-separated allowlist (malware,dangerous_file,blocked_site,app_blocked,\n"
+            "# app_timer_expired,blocking_error); empty means forward everything."
+        ),
+    )
+    print(C.GREEN + f"Saved to {SERVER_ENV_PATH}" + C.RESET)
+    _telegram_send_test(token, chat_id)
+    print(C.YELLOW + "Restart the dashboard (option 1) — the server reads .env at startup." + C.RESET)
+
+
+def _telegram_send_test(token: str, chat_id: str) -> bool:
+    """Prove the pair works end to end, from GUARD, without the server running."""
+    if not token or not chat_id:
+        print(C.RED + "Need both a token and a chat id to test." + C.RESET)
+        return False
+    print(C.DIM + "  Sending test message..." + C.RESET)
+    ok, _result, detail = telegram_api(
+        token,
+        "sendMessage",
+        {
+            "chat_id": chat_id,
+            "text": (
+                "✅ <b>GUARDIAN connected</b>\n"
+                "This chat will receive device alerts from your Guardian dashboard."
+            ),
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        },
+    )
+    if ok:
+        print(C.GREEN + "  Delivered — check your phone." + C.RESET)
+        return True
+    print(C.RED + f"  Not delivered: {detail}" + C.RESET)
+    if "chat not found" in detail.lower():
+        print(C.DIM + "  Open the bot in Telegram and send it a message first, then re-test." + C.RESET)
+    return False
+
+
+# ─── SSH data transfer (Pi → this machine) ───────────────────────────────────
+# Pulls the monitored device's own records off the Pi: the progress spools the
+# agent has not yet drained over the socket, the history cursor, the agent log and
+# the service journal. Read-only on the Pi apart from one /tmp staging directory,
+# which is removed afterwards. Nothing is restarted and nothing is killed — this
+# is a diagnostic and archival path, so it must be safe to run at any moment.
+#
+# The agent runs as root, so its state lives under /root and is not readable by
+# the SSH user. The staging step therefore copies with sudo, hands ownership to the
+# SSH user, and tars the result: one file to fetch instead of a dozen sudo reads.
+
+# What gets collected, as (remote directory, folder name inside the export). The
+# agent's own state comes first; the same paths under the SSH user's home are
+# collected too, because an agent started by hand (not by systemd) writes there and
+# an export that quietly skipped it would look like "the child did nothing".
+PI_DATA_SOURCES = [
+    ("/root/.guardian-shield/progress", "progress"),
+    ("/root/.guardian-shield/logs", "logs"),
+    ("$HOME/.guardian-shield/progress", "progress-user"),
+    ("$HOME/.guardian-shield/logs", "logs-user"),
+]
+
+
+def _pi_export_cmd(cfg: Dict[str, str], stage: str, archive: str) -> str:
+    """The remote side of a data pull: stage, describe, archive, hand over.
+
+    Built as one "; "-joined line like every other remote command here, NOT as a
+    bash -lc '...' wrapper: sudo_preamble() itself contains single quotes, so a
+    single-quoted wrapper would terminate early and the password would end up as
+    an argument. Callers prepend the preamble exactly as the deploy path does.
+
+    Every copy ends in `|| true`. A Pi that never ran the app collector has no
+    usage.jsonl, and that is a normal export, not a failure — the MANIFEST is what
+    says which parts came back.
+    """
+    install = cfg["pi_install_dir"]
+    service = cfg["pi_service"]
+    user = cfg["pi_username"]
+    q_stage = shlex.quote(stage)
+    q_archive = shlex.quote(archive)
+    q_svc = shlex.quote(service)
+
+    parts = [
+        # No `pkill` anywhere in this chain, by design: an export must never be
+        # able to stop the agent it is exporting from (BUG-23).
+        f"rm -rf {q_stage} {q_archive} 2>/dev/null || true",
+        "mkdir -p " + " ".join(
+            shlex.quote(f"{stage}/{dest}") for _src, dest in PI_DATA_SOURCES
+        ) + f" {shlex.quote(stage + '/agent')} {shlex.quote(stage + '/service')}",
+    ]
+    for src, dest in PI_DATA_SOURCES:
+        # Double quotes, not shlex.quote: "$HOME" has to expand on the Pi. These
+        # are fixed literals from this file, never user input.
+        parts.append(f'sudo -n cp -a "{src}/." "{stage}/{dest}/" 2>/dev/null || true')
+    for name in ("config.json", "warning_counts.json", "kill_attempts.txt"):
+        parts.append(
+            f"sudo -n cp -a {shlex.quote(install + '/' + name)} "
+            f"{shlex.quote(stage + '/agent/')} 2>/dev/null || true"
+        )
+    parts += [
+        f"{{ sudo -n journalctl -u {q_svc} -n 2000 --no-pager 2>/dev/null "
+        f"|| journalctl -u {q_svc} -n 2000 --no-pager 2>/dev/null "
+        f"|| echo '(journal unavailable)'; }} > {shlex.quote(stage + '/service/journal.txt')}",
+        f"{{ systemctl is-active {q_svc} 2>/dev/null; systemctl is-enabled {q_svc} "
+        f"2>/dev/null; }} > {shlex.quote(stage + '/service/state.txt')} || true",
+        f"{{ uname -a; date -Is; uptime; df -h /; }} "
+        f"> {shlex.quote(stage + '/service/host.txt')} 2>/dev/null || true",
+        # Sizes and paths of everything staged, so the local side can prove what
+        # arrived without opening a single one of the child's records.
+        f"find {q_stage} -type f -printf '%s\\t%P\\n' 2>/dev/null | sort -k2 "
+        f"> {shlex.quote(stage + '/MANIFEST.txt')} || true",
+        f"sudo -n chown -R {shlex.quote(user + ':' + user)} {q_stage} 2>/dev/null || true",
+        f"tar -czf {q_archive} -C {shlex.quote(str(PurePosixPath(stage).parent))} "
+        f"{shlex.quote(PurePosixPath(stage).name)} 2>/dev/null",
+        # Staging is deleted immediately: it is a plaintext copy of the child's
+        # records sitting in a world-readable /tmp until it goes.
+        f"rm -rf {q_stage} 2>/dev/null || true",
+        f"echo GUARDIAN_EXPORT=$( [ -s {q_archive} ] && echo ok || echo empty )",
+        f"echo GUARDIAN_BYTES=$(stat -c %s {q_archive} 2>/dev/null || echo 0)",
+    ]
+    return "; ".join(parts)
+
+
+def _safe_extract(archive: Path, dest: Path) -> Tuple[int, int]:
+    """Unpack the export with Python's tarfile, never Windows `tar`.
+
+    Two reasons. Older Windows builds have no bsdtar at all, and the ones that do
+    handle a Linux-made .tar.gz inconsistently. And a tarball is a list of paths a
+    remote machine chose: a member named ../../something would otherwise be written
+    outside the export folder. Python 3.12+ enforces that with filter="data"; on
+    older interpreters the same check is done by hand, because the Windows Pythons
+    in the field are not all 3.12.
+
+    Returns (files written, members rejected).
+    """
+    dest.mkdir(parents=True, exist_ok=True)
+    root = dest.resolve()
+    written = 0
+    rejected = 0
+    with tarfile.open(archive, "r:gz") as tf:
+        members = []
+        for m in tf.getmembers():
+            if m.issym() or m.islnk():
+                rejected += 1          # a link could point anywhere on this disk
+                continue
+            target = (root / m.name).resolve()
+            if target != root and root not in target.parents:
+                rejected += 1
+                continue
+            members.append(m)
+            if m.isfile():
+                written += 1
+        try:
+            tf.extractall(dest, members=members, filter="data")
+        except TypeError:
+            # Python < 3.12: no filter argument. The loop above already did the
+            # containment check, so this is the same guarantee, hand-rolled.
+            tf.extractall(dest, members=members)
+    return written, rejected
+
+
+def _export_summary(folder: Path) -> List[str]:
+    """One line per part of the export, counting rows rather than reading them.
+
+    Deliberately shallow: this prints how much came back, never what it says. The
+    child's browsing history is in these files and the terminal is not the place
+    for it — the dashboard is.
+    """
+    lines: List[str] = []
+    for sub, label in (("progress", "progress spool (root)"),
+                       ("progress-user", "progress spool (user)"),
+                       ("logs", "agent logs (root)"),
+                       ("logs-user", "agent logs (user)"),
+                       ("agent", "agent config"),
+                       ("service", "service state")):
+        d = folder / sub
+        if not d.is_dir():
+            continue
+        files = sorted(p for p in d.rglob("*") if p.is_file())
+        if not files:
+            continue
+        total = sum(p.stat().st_size for p in files)
+        rows = 0
+        for p in files:
+            if p.suffix == ".jsonl":
+                try:
+                    with open(p, "r", encoding="utf-8", errors="replace") as fh:
+                        rows += sum(1 for line in fh if line.strip())
+                except OSError:
+                    pass
+        detail = f"{len(files)} file(s), {total // 1024 or 1} KB"
+        if rows:
+            detail += f", {rows} queued record(s)"
+        lines.append(f"  {label:<24} {detail}")
+    return lines
+
+
+def pull_pi_data(cfg: Dict[str, str], pi_ip: str) -> Optional[Path]:
+    """Stage on the Pi, fetch one tarball, unpack it here. Returns the folder.
+
+    One archive rather than a dozen scp reads: each remote path would otherwise
+    need its own sudo round trip, and a partial set of them is indistinguishable
+    from "the child used nothing today".
+    """
+    stamp = time.strftime("%Y-%m-%d_%H%M%S")
+    stage = f"/tmp/guardian-export-{stamp}"
+    archive = f"{stage}.tar.gz"
+    dest = DATA_EXPORT_DIR / stamp
+
+    print(C.BLUE + f"Staging the export on the Pi ({pi_ip})..." + C.RESET)
+    cmd = sudo_preamble(cfg) + "; " + _pi_export_cmd(cfg, stage, archive)
+    if _unattended_ssh(cfg):
+        rc, out = ssh_capture(cfg, pi_ip, cmd, timeout=180)
+    else:
+        # OpenSSH will prompt for the password; capturing would hide the prompt,
+        # so let it stream and read the outcome from the archive instead.
+        print(C.YELLOW + "No plink/sshpass — enter the Pi password when asked."
+              + C.RESET)
+        rc = ssh_exec(cfg, pi_ip, cmd, tty=True, timeout=300)
+        out = ""
+
+    state = _marker(out, "GUARDIAN_EXPORT")
+    if state == "empty":
+        print(C.RED + "The Pi produced an empty archive — nothing was readable."
+              + C.RESET)
+        print(C.DIM + "Usually sudo: run option 3 (verify) to check SSH+sudo."
+              + C.RESET)
+        return None
+    if out and state != "ok":
+        print(C.RED + "The staging step did not report success." + C.RESET)
+        print(C.DIM + (out or f"ssh exit {rc}")[-600:] + C.RESET)
+        return None
+
+    remote_bytes = _marker(out, "GUARDIAN_BYTES")
+    if remote_bytes.isdigit():
+        print(C.DIM + f"  archive on the Pi: {int(remote_bytes) // 1024 or 1} KB"
+              + C.RESET)
+
+    print(C.BLUE + "Downloading..." + C.RESET)
+    landing = DATA_EXPORT_DIR / f".incoming-{stamp}"
+    if scp_pull(cfg, pi_ip, [archive], str(landing)) != 0:
+        print(C.RED + "Download failed. The Pi still holds the archive at "
+              + archive + C.RESET)
+        return None
+
+    local_archive = landing / f"guardian-export-{stamp}.tar.gz"
+    if not local_archive.exists():
+        found = sorted(landing.glob("*.tar.gz"))
+        if not found:
+            print(C.RED + "scp reported success but no archive arrived." + C.RESET)
+            return None
+        local_archive = found[0]
+
+    print(C.BLUE + "Unpacking..." + C.RESET)
+    try:
+        written, rejected = _safe_extract(local_archive, dest)
+    except (tarfile.TarError, OSError) as exc:
+        print(C.RED + f"The archive could not be read: {exc}" + C.RESET)
+        print(C.DIM + f"It is kept at {local_archive} in case it is salvageable."
+              + C.RESET)
+        return None
+    if rejected:
+        print(C.YELLOW + f"  {rejected} archive entry(ies) refused as unsafe "
+              "paths — reported, not silently dropped." + C.RESET)
+
+    # The export unpacks as .../<stamp>/guardian-export-<stamp>/... because tar
+    # keeps the staging folder name. Flatten that so the printed path is the data.
+    inner = dest / f"guardian-export-{stamp}"
+    if inner.is_dir():
+        for entry in list(inner.iterdir()):
+            target = dest / entry.name
+            if not target.exists():
+                shutil.move(str(entry), str(target))
+        try:
+            inner.rmdir()
+        except OSError:
+            pass
+
+    # Remove the tarball from the Pi. Its contents are a plaintext copy of the
+    # child's records; leaving it in /tmp would outlive the reason it existed.
+    ssh_exec(cfg, pi_ip, f"rm -f {shlex.quote(archive)}", timeout=30)
+    shutil.rmtree(landing, ignore_errors=True)
+
+    print(C.GREEN + f"Export complete — {written} file(s)." + C.RESET)
+    for line in _export_summary(dest):
+        print(line)
+    print(C.DIM + "  (MANIFEST.txt lists every file with its size.)" + C.RESET)
+    print(C.GREEN + "Saved to: " + C.RESET + str(dest))
+    return dest
+
+
+def action_pull_data(cfg: Dict[str, str]) -> None:
+    """Menu/CLI entry point for a data pull."""
+    print(C.BLUE + "Pull monitored-device data from the Pi over SSH" + C.RESET)
+    print(C.DIM + "Read-only on the Pi: nothing is stopped, restarted or deleted "
+          "except the temporary archive this creates." + C.RESET)
+
+    pi_ip = _quick_detect_pi_ip(cfg)
+    if not pi_ip:
+        local_ips = get_local_ipv4s()
+        pi_ip = detect_pi_ip(cfg, local_ips) if local_ips else None
+    if not pi_ip:
+        print(C.RED + "The Pi could not be reached over SSH." + C.RESET)
+        print(C.DIM + f"Tried {cfg.get('last_pi_ip', '-')} and "
+              f"{cfg['pi_hostname']}. Put the Pi on the same Wi-Fi and retry, "
+              "or run option 3 to verify." + C.RESET)
+        return
+
+    folder = pull_pi_data(cfg, pi_ip)
+    if folder is None:
+        return
+    STATUS["data_pulled"] = True
+    print(C.DIM + "This is an archive copy. The dashboard's own database is "
+          "still the live record — a pull changes nothing on either side."
+          + C.RESET)
+
+
 def action_close_all_systems(cfg: Dict[str, str]) -> None:
     global AUTO_REDIRECT_DONE
-
     boot_sequence("GLOBAL SHUTDOWN", [
         "Stop local live-control tasks",
         "Terminate dashboard sockets",
@@ -1513,8 +2170,37 @@ def run_cli(argv: List[str]) -> int:
     if cmd in ("diag", "doctor", "logs"):
         return 0 if pi_diag(cfg) else 1
 
+    if cmd in ("progress", "academic", "academics", "grades"):
+        action_open_progress(cfg)
+        return 0
+
+    if cmd in ("telegram", "tg", "alerts"):
+        # `GUARD.bat telegram test` re-tests the saved pair without the prompts.
+        if len(argv) > 1 and argv[1].lower() == "test":
+            env = read_server_env()
+            ok = _telegram_send_test(
+                env.get("TELEGRAM_BOT_TOKEN", ""), env.get("TELEGRAM_CHAT_ID", "")
+            )
+            return 0 if ok else 1
+        action_telegram(cfg)
+        return 0
+
+    if cmd in ("datapull", "pull", "fetch", "export"):
+        # TRANSFER-DATA.bat lands here. Exit code matters: this is the one command
+        # likely to be put in a scheduled task, and a silent 0 on a failed pull
+        # would look like a nightly archive that is quietly empty.
+        pi_ip = _quick_detect_pi_ip(cfg)
+        if not pi_ip:
+            local_ips = get_local_ipv4s()
+            pi_ip = detect_pi_ip(cfg, local_ips) if local_ips else None
+        if not pi_ip:
+            print(C.RED + "Pi not reachable — nothing pulled." + C.RESET)
+            return 1
+        return 0 if pull_pi_data(cfg, pi_ip) else 1
+
     print(C.RED + f"Unknown command: {cmd}" + C.RESET)
-    print("Commands: deploy | verify | diag | build | ip <addr> [port] | status")
+    print("Commands: deploy | verify | diag | build | progress | telegram [test] | "
+          "datapull | ip <addr> [port] | status")
     return 2
 
 
@@ -1534,6 +2220,12 @@ def main() -> None:
             action_set_server_ip(cfg)
         elif choice.lower() == "t":
             pi_diag(cfg)
+        elif choice.lower() == "a":
+            action_open_progress(cfg)
+        elif choice.lower() == "m":
+            action_telegram(cfg)
+        elif choice.lower() == "p":
+            action_pull_data(cfg)
         elif choice == "1":
             action_launch_dashboard()
         elif choice == "2":

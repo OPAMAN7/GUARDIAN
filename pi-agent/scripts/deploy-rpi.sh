@@ -55,6 +55,13 @@ apt-get install -y -qq \
     2>/dev/null
 log "System dependencies installed"
 
+# Academic-progress accuracy. Separate line on purpose: one unavailable package
+# must not fail the whole install. The collectors run without it and simply
+# count wall-clock minutes instead of trimming idle time.
+apt-get install -y -qq xprintidle 2>/dev/null \
+    && log "Idle detection installed (academic time will be idle-trimmed)" \
+    || warn "xprintidle unavailable — academic time counts wall-clock minutes"
+
 # ── 2. Node.js version check (need 18+) ─────────────────────
 NODE_VER=$(node --version | sed 's/v//' | cut -d. -f1)
 if [ "$NODE_VER" -lt 18 ]; then

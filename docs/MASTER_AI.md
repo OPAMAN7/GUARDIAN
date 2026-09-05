@@ -73,6 +73,15 @@ or menu **I** rather than by hand.
 | [`pi-agent/agent/blocker.py`](file:///c:/GUARDIAN/pi-agent/agent/blocker.py) | **Hosts File Blocker**: Modifies `/etc/hosts` or Windows `hosts` to redirect blocked domains to 127.0.0.1. |
 | [`pi-agent/agent/block_page_server.py`](file:///c:/GUARDIAN/pi-agent/agent/block_page_server.py) | **Local Warning Server**: Serves warning pages (Level 1-3 & NUH UH) when blocked domains are accessed. |
 | [`pi-agent/agent/screenshot.py`](file:///c:/GUARDIAN/pi-agent/agent/screenshot.py) | **Screen Capture**: JPEG-compressed frames with dynamic FPS/resolution scaling. Backend is chosen at runtime, in order: window capture (Windows), **`grim`** (Wayland — the Raspberry Pi OS Bookworm desktop default), `scrot` (X11/Xvfb), then `mss`. The Wayland target is re-probed while no backend works, because systemd can start the agent before the compositor exists. |
+| [`pi-agent/agent/usage_tracker.py`](file:///c:/GUARDIAN/pi-agent/agent/usage_tracker.py) | **App usage collector** (`source='app'`). Turns foreground-window samples into sessions, trimmed by idle time via `xprintidle` when it is installed. Emits to the spool, never straight to the socket. |
+| [`pi-agent/agent/browser_history.py`](file:///c:/GUARDIAN/pi-agent/agent/browser_history.py) | **Web + YouTube collector** (`source='web'` and `source='watch'`). Reads Chromium `History` and Firefox `places.sqlite` by copying first (the live file is locked), keeps a per-browser watermark in `history_state.json` so a restart re-reads nothing, and splits YouTube out as its own source with its own category rules. |
+| [`pi-agent/agent/spool.py`](file:///c:/GUARDIAN/pi-agent/agent/spool.py) | **Offline queue** under `/root/.guardian-shield/progress`. Append-only JSONL, drained when the socket is up. This is what `TRANSFER-DATA.bat` pulls, and why a pull is worth doing when the dashboard looks empty. |
+| [`parent-dashboard/server-ts/services/classifier.js`](file:///c:/GUARDIAN/parent-dashboard/server-ts/services/classifier.js) | **Categorisation**: three *disjoint* vocabularies, one per source. Parent overrides come from the rule editor (3-character minimum — see BUG-13). |
+| [`parent-dashboard/server-ts/services/rollup.js`](file:///c:/GUARDIAN/parent-dashboard/server-ts/services/rollup.js) | **Daily rollup + the privacy boundary.** `summarize()` is the only thing the AI ever sees: minutes per category per source. If a field is not in `summarize()`, it does not leave the machine. |
+| [`parent-dashboard/server-ts/services/ai.js`](file:///c:/GUARDIAN/parent-dashboard/server-ts/services/ai.js) | **Gemini narrative.** Detects the key flavour (`AIza…` = AI Studio, `AQ.…` = Vertex express) and picks the matching host; caches by input hash; daily call budget; degrades to plain numbers on any failure. |
+| [`parent-dashboard/server-ts/services/telegram.js`](file:///c:/GUARDIAN/parent-dashboard/server-ts/services/telegram.js) | **Phone alert channel.** Pushed fire-and-forget from the socket `alert` handler. Claims a `notify_log` row *before* the network call, so one alert is one message even across a restart. Hourly ceiling; drops rather than queues. |
+| [`parent-dashboard/server-ts/routes/progress.js`](file:///c:/GUARDIAN/parent-dashboard/server-ts/routes/progress.js) | **Progress API.** `authMiddleware` on every route without exception — this is the most sensitive data in the product. History deletion requires `{"confirm":"DELETE"}`. |
+| [`parent-dashboard/server-ts/.env`](file:///c:/GUARDIAN/parent-dashboard/server-ts/.env) | **Server secrets, gitignored and untracked**: `GEMINI_API_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `JWT_SECRET`, `ADMIN_PASSWORD`. Read once at startup — **any change needs a dashboard restart.** Never put these in `guard_runtime.json`, and never let one reach the browser bundle. |
 | [`pi-agent/agent/tests/test_wayland_redetect.py`](file:///c:/GUARDIAN/pi-agent/agent/tests/test_wayland_redetect.py) | **BUG-28 regression test.** Fakes `grim` and a compositor socket that appears late; proves `capture()` recovers instead of caching "no Wayland" forever. Runs anywhere — no Pi, no network. |
 | [`pi-agent/agent/guardian_watchdog.py`](file:///c:/GUARDIAN/pi-agent/agent/guardian_watchdog.py) | **Agent Supervisor**: Monitors agent PID and auto-restarts if killed. |
 | [`parent-dashboard/server-ts/index.js`](file:///c:/GUARDIAN/parent-dashboard/server-ts/index.js) | **Backend Entry Point**: Express + Socket.IO server, real-time broadcasts, screenshot ingestion. Sockets are classified at handshake (viewer / agent / anonymous); only viewers join the `dashboard-viewers` room, so frames are never echoed back at the agent. |
@@ -82,7 +91,8 @@ or menu **I** rather than by hand.
 | [`parent-dashboard/web-ts/style.css`](file:///c:/GUARDIAN/parent-dashboard/web-ts/style.css) | **Design System**: Dark-theme glassmorphism tokens, active app hero card, timer strips, responsive grids. |
 | [`windows-app/launcher/GuardianOneClick.cs`](file:///c:/GUARDIAN/windows-app/launcher/GuardianOneClick.cs) | **Windows One-Click Launcher**: C# tray app that launches watchdog, proxy, and dashboard. |
 | [`windows-app/watchdog/watchdog_server.py`](file:///c:/GUARDIAN/windows-app/watchdog/watchdog_server.py) | **Windows Watchdog**: Supervises parent-dashboard process on Windows. |
-| [`GUARD.bat`](file:///c:/GUARDIAN/GUARD.bat) | **Entry point for everything.** Thin wrapper: checks Python is on PATH, forwards args to `GUARD.py`. Subcommands: `deploy`, `verify`, `diag`, `ip <addr>`. |
+| [`GUARD.bat`](file:///c:/GUARDIAN/GUARD.bat) | **Entry point for everything.** Thin wrapper: checks Python is on PATH, forwards args to `GUARD.py`. Subcommands: `deploy`, `verify`, `diag`, `build`, `progress`, `telegram [test]`, `datapull`, `ip <addr>`, `status`. |
+| [`TRANSFER-DATA.bat`](file:///c:/GUARDIAN/TRANSFER-DATA.bat) | **Double-click data pull.** Same as `GUARD.bat datapull` / menu `P`. Copies the Pi's progress spool, agent logs, agent config and service journal into `data-exports\<date_time>\`. Read-only on the Pi — nothing is stopped, restarted or killed, so it is safe mid-session. Skips its `pause` when given arguments, so it is safe in a scheduled task. |
 | [`GUARD.py`](file:///c:/GUARDIAN/GUARD.py) | **Master CLI**: menu + Pi lifecycle. Detects the Pi, primes the SSH host key, seeds the sudo credential cache, uploads the agent, runs the installer, patches `server_url`, restarts and verifies the service, and starts/stops local dashboard + Windows agent. Every remote step is a named phase with its own error message. |
 | [`windows-app/config/guard_runtime.json`](file:///c:/GUARDIAN/windows-app/config/guard_runtime.json) | **Single source of truth** for Pi credentials, install dir, service name, dashboard IP/port. Written by `GUARD.py`; never hardcode these values elsewhere. |
 | [`docs/SESSION_MEMORY.md`](file:///c:/GUARDIAN/docs/SESSION_MEMORY.md) | **Running bug log** (BUG-01…). Root cause, fix and verification state per bug. Append here; do not re-diagnose an entry that is already closed. |
@@ -124,6 +134,25 @@ predated the socket auth handshake. Note that BUG-28 and BUG-29 present *identic
   * Dedicated **"Apps"** sidebar page in web dashboard + Live View active app badge.
 * [x] **Pi Deployment Automation**: full agent upload, installer bootstrap, `server_url`
   patch, service restart and verification — all through `GUARD.bat`.
+* [x] **F-18…F-23: Academic Progress (part of the basic product — no add-on, no gating)**
+  * Three collectors on the Pi: foreground app sessions, browser history, YouTube watches.
+  * **The three sources never mix.** `progress_daily` is keyed
+    `(device_id, day, source, category)` with source in `app` | `web` | `watch`, and each
+    source has its own category vocabulary. A maths lecture and a prank video are both
+    youtube.com; grouping them would make the whole score meaningless.
+  * Score ring, 14-day stacked trend, and three separate per-source sections in the
+    dashboard. Opened by `GUARD.bat progress` or menu `A`.
+  * Grading rubric ships in `services/classifier.js`. It was designed here, on purpose —
+    the parent is never asked to supply a daily-minutes target.
+  * AI narrative from **aggregates only**, cached by input hash, on a daily call budget,
+    degrading to plain numbers when the provider is unreachable.
+* [x] **F-26: Telegram phone alerts** — `GUARD.bat telegram` / menu `M`. Takes the BotFather
+  token, validates it with `getMe`, discovers the chat id from `getUpdates` so no numeric id
+  is typed by hand, and writes the pair into `.env`. All-or-nothing: nothing is saved unless
+  it is proven to work, because a saved-but-invalid token means the dashboard believes it can
+  reach the parent and stays silent.
+* [x] **F-27: SSH data transfer** — `TRANSFER-DATA.bat` / `GUARD.bat datapull` / menu `P`.
+  One timestamped folder per run under `data-exports\`, never overwritten. Gitignored.
 
 ---
 

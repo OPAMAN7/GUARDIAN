@@ -39,6 +39,21 @@ from block_page_server import start_block_server
 from buzzer import play_warning
 from app_tracker import AppTracker
 
+# Academic-progress collectors. Imported defensively on purpose: these three
+# modules are new and non-critical, while blocking and screen capture are not. A
+# partial deploy (one file missing) or an import-time error must degrade the
+# progress feature, never take the whole agent down with it.
+try:
+    from spool import Spool
+    from usage_tracker import UsageTracker
+    from browser_history import BrowserHistoryCollector
+    PROGRESS_IMPORT_ERROR = None
+except Exception as _prog_err:  # pragma: no cover - depends on deploy contents
+    Spool = None            # type: ignore[assignment]
+    UsageTracker = None     # type: ignore[assignment]
+    BrowserHistoryCollector = None  # type: ignore[assignment]
+    PROGRESS_IMPORT_ERROR = _prog_err
+
 # ─── Logging Setup ────────────────────────────────────────────────────────────
 
 LOG_DIR = Path.home() / ".guardian-shield" / "logs"
@@ -67,6 +82,22 @@ HEARTBEAT_INTERVAL_SEC = 5.0
 # If the server never acknowledges an in-flight frame within this window, stop
 # waiting for the ack and send the next frame anyway.
 SEND_ACK_TIMEOUT_SEC = 2.5
+
+# ─── Academic-progress uplink ─────────────────────────────────────────────────
+
+# Spool + watermark files. Same root as the screenshot cache and the logs, so
+# there is exactly one place to look for agent state (and to wipe on uninstall).
+PROGRESS_STATE_DIR = Path.home() / ".guardian-shield" / "progress"
+
+# How often queued progress records are shipped. Deliberately slow: these are
+# aggregates for a daily report, not live telemetry, and a 30 s cadence keeps the
+# socket free for the frames that do need to be timely.
+PROGRESS_DRAIN_INTERVAL_SEC = 30.0
+
+# A progress batch is an INSERT OR IGNORE of up to 250 rows inside one
+# transaction. Generous timeout because the batch is *not* discarded on a
+# timeout — it is retried, and a duplicate insert is a no-op server-side.
+PROGRESS_ACK_TIMEOUT_SEC = 20.0
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -556,6 +587,45 @@ class GuardianAgent:
             upload_fn=self._upload_cached_screenshot,
             check_interval=10.0,
         )
+
+        # ── Academic-progress collectors ────────────────────────────────────
+        # Two independent ledgers that are never merged: focused-app sessions
+        # ("app" source) and browser history ("web"/"youtube" source). They are
+        # spooled to disk first so a Wi-Fi drop costs nothing, and every record
+        # carries a stable key so a retry cannot double-count study minutes.
+        self.enable_progress_tracking = bool(config.get("enable_progress_tracking", True))
+        self.usage_spool = None
+        self.web_spool = None
+        self.usage_tracker = None
+        self.history_collector = None
+        if not self.enable_progress_tracking:
+            logger.info("Academic-progress collection disabled by config")
+        elif PROGRESS_IMPORT_ERROR is not None:
+            logger.error(
+                "Academic-progress collection unavailable (%s) — the rest of the "
+                "agent is unaffected. Re-deploy the agent files to enable it.",
+                PROGRESS_IMPORT_ERROR,
+            )
+        else:
+            try:
+                self.usage_spool = Spool(PROGRESS_STATE_DIR / "usage.jsonl")
+                self.web_spool = Spool(PROGRESS_STATE_DIR / "web.jsonl")
+                self.usage_tracker = UsageTracker(
+                    self.app_tracker,
+                    self.usage_spool,
+                    idle_detection=bool(config.get("progress_idle_trim", True)),
+                )
+                self.history_collector = BrowserHistoryCollector(
+                    self.web_spool,
+                    PROGRESS_STATE_DIR / "history_state.json",
+                    extra_homes=config.get("progress_extra_homes") or None,
+                )
+                logger.info("Academic-progress collectors ready (state: %s)",
+                            PROGRESS_STATE_DIR)
+            except Exception as exc:
+                logger.error("Academic-progress collectors failed to initialise: %s", exc)
+                self.usage_tracker = None
+                self.history_collector = None
 
     def _apply_remote_config(self, data: dict):
         """Apply stream-tuning updates sent from dashboard."""
@@ -1190,6 +1260,23 @@ class GuardianAgent:
         # can make the device look offline.
         threading.Thread(target=self._heartbeat_loop, daemon=True, name="heartbeat").start()
 
+        # 5c. Start the academic-progress collectors. Three separate threads on
+        # purpose: a stalled history read (a browser DB locked by a crashed
+        # Chromium) must not stop usage sampling, and neither must be able to
+        # block on the network — only the uplink thread touches the socket.
+        if self.usage_tracker:
+            threading.Thread(
+                target=self.usage_tracker.run_loop, args=(lambda: self._running,),
+                daemon=True, name="usage-collector").start()
+        if self.history_collector:
+            threading.Thread(
+                target=self.history_collector.run_loop, args=(lambda: self._running,),
+                daemon=True, name="web-history-collector").start()
+        if self.usage_spool or self.web_spool:
+            threading.Thread(
+                target=self._progress_uplink_loop,
+                daemon=True, name="progress-uplink").start()
+
         # 6. Start screenshot loop (blocking — runs forever)
         logger.info("Starting screenshot capture...")
         target_fps = float(self.config.get("target_fps", 0) or 0)
@@ -1301,6 +1388,56 @@ class GuardianAgent:
 
             time.sleep(3.5)
 
+    def _progress_uplink_loop(self):
+        """Ship spooled academic-progress records to the server.
+
+        The only thread that touches both the spool and the socket. Records stay
+        on disk until the server positively acknowledges them, so the failure
+        mode of a drop-out is a delayed report, never a wrong number.
+        """
+        time.sleep(8.0)  # let the socket settle; nothing here is time-critical
+        while self._running:
+            try:
+                if self.server and self.server.connected:
+                    if self.usage_spool:
+                        self.usage_spool.drain(
+                            lambda batch: self._ship_progress("usage_batch", batch))
+                    if self.web_spool:
+                        self.web_spool.drain(
+                            lambda batch: self._ship_progress("web_batch", batch))
+            except Exception as e:
+                logger.debug(f"Progress uplink tick note: {e}")
+            time.sleep(PROGRESS_DRAIN_INTERVAL_SEC)
+
+    def _ship_progress(self, event: str, batch: list) -> Optional[int]:
+        """Emit one batch and block until the server acknowledges it.
+
+        Returns the accepted count, or None to leave the batch queued. A count
+        *lower* than the batch size is still success: the server de-duplicates
+        with INSERT OR IGNORE, so the difference is replayed records it already
+        had — exactly the outcome the stable keys exist to produce.
+
+        ``sio.call`` blocks the calling thread until the ack arrives. That is
+        safe here because this is a dedicated thread; doing it inside a socket
+        event handler would stall the client's read loop.
+        """
+        if not batch:
+            return 0
+        try:
+            resp = self.server.sio.call(
+                event,
+                {"device_name": self.server.device_name, "records": batch},
+                timeout=PROGRESS_ACK_TIMEOUT_SEC,
+            )
+        except Exception as e:
+            logger.debug(f"{event} not acknowledged ({len(batch)} record(s) requeued): {e}")
+            return None
+        if isinstance(resp, dict) and resp.get("ok"):
+            accepted = resp.get("accepted")
+            return accepted if isinstance(accepted, int) else len(batch)
+        logger.warning(f"{event} refused by server, keeping records: {resp}")
+        return None
+
     def stop(self):
         """Stop all agent modules gracefully."""
         self._running = False
@@ -1313,6 +1450,23 @@ class GuardianAgent:
             self.blocklist_updater.stop()
         if self.download_guard:
             self.download_guard.stop()
+
+        # Close the open focus session before the socket goes away, so the last
+        # block of study time is not lost. This writes to disk only — a final
+        # network drain would make shutdown wait on a socket timeout, and the
+        # spool survives the restart anyway.
+        if self.usage_tracker:
+            try:
+                self.usage_tracker.flush()
+            except Exception as exc:
+                logger.debug(f"Usage flush note: {exc}")
+        try:
+            queued = sum(s.pending() for s in (self.usage_spool, self.web_spool) if s)
+            if queued:
+                logger.info(f"{queued} progress record(s) queued for the next run")
+        except Exception:
+            pass
+
         self.screenshotter.close()
         self.server.disconnect()
 
