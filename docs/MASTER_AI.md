@@ -260,7 +260,7 @@ of the page keep working (that was BUG-29: a blank live view with the device onl
 ---
 
 ## 📌 LAST AI CHANGES & STATUS
-> *This section was updated on 2026-09-02 by Claude (Opus 5).*
+> *Latest planning update: 2026-10-23. Earlier implementation notes below are historical.*
 
 ### 🛠️ What was executed in this session
 
@@ -349,29 +349,41 @@ of the page keep working (that was BUG-29: a blank live view with the device onl
 
 ### 🎯 Next steps
 
-* **Run `GUARD.bat build`, then hard-refresh the dashboard (Ctrl+Shift+R).** Until the
-  bundle is rebuilt the live view cannot work no matter what the Pi does — see BUG-29
-  above. Menu `1` now does this build automatically.
-* Run `GUARD.bat deploy` (or menu 3) to ship the `screenshot.py` fix, then
-  `GUARD.bat diag`. Its first line is the `Dashboard UI` freshness check; after that,
-  `CAPTURE_FAIL=0` with a non-empty `WAYLAND_SOCKETS` means the mirror should be live, and
-  a blank `WAYLAND_SOCKETS` means no desktop session is logged in.
-* The user-review checklist below is **historical**. Those app/message failures were
-  traced to a single AppTracker lock stall (BUG-10 in `docs/SESSION_MEMORY.md`) and
-  fixed; re-test them on hardware rather than re-diagnosing from scratch.
-* Remaining open items: **BUG-03** (`.env` secrets) is the highest-value one.
+* **Active product direction (2026-10-23):** user wants Guardian PC to replace Linux/Pi
+  child installs with a Windows child-device installer. Read `GUARDIAN PC/PLAN.md` before
+  proposing packaging or platform work. The supplied parent-dashboard Stitch archive is
+  copied to `GUARDIAN PC/design-reference/` and must be integrated into the existing
+  `parent-dashboard/web-ts` app; section 3.1 maps its screens and integration gates. The
+  plan prioritizes system-wide Windows filtering
+  and managed-browser URL-path rules; a custom WFP driver is gated on evidence, threat
+  modeling, signing, and independent review. It rejects stealth, disabling Windows
+  security, and claims of defeating every VPN/proxy. Begin with read-only AI reconnaissance
+  and resolve product-owner decisions before implementation.
+
 * Update this section and `docs/SESSION_MEMORY.md` before you end your turn.
+
+### 2026-10-23 — Guardian PC product planning
+
+- Created `GUARDIAN PC/PLAN.md` after the user clarified the target is a Windows child
+  device, with no Linux customer setup. The plan was then expanded to prioritize
+  system-wide Windows filtering and managed-browser path rules (including block Shorts /
+  allow regular YouTube), with a custom WFP driver considered only if the policy-based
+  design has a demonstrated gap and review gates pass. It documents current Windows gaps,
+  visible/limited collection, packaging phases, prerequisites, AI workflow, and decisions.
+- Updated `docs/README.md` to make the plan discoverable. No application code, installer,
+  or driver was changed; no tests were run. On 2026-10-23, copied the supplied Stitch ZIP
+  into `GUARDIAN PC/design-reference/` and updated section 3.1 of the plan to map its
+  eight screens/modal into the current dashboard, with real API wiring, responsive/visual
+  acceptance, and a warning that prototype content is not production data or authority.
+  The plan's technical references were checked against current Microsoft documentation.
+- Next: ask the owner to decide whether the parent dashboard is home-network-only or must
+  be remotely accessible. Before code changes, run the plan's read-only AI reconnaissance
+  task and resolve the remaining product decisions. Do not promise zero exploits or
+  universal URL-path and VPN/proxy blocking.
 
 ### THIS IS THE USER REVIEW OF PRIVIOUS AI (DO NOT CHANGE)
 ## THIS IS A CONSIDERATION NEXT AI NEEDS TO DO BEFORE ENDING SESSION ATLEAST AND TEST THESE 
-# THE MESSSAGE SEND FEATURE IS NOT RUNNING ONTO THE PI IN THE FIRST TEST 
-# THE APP CONTROL SYSTEM ARE NOT WORKING ON THE PI 
-# WHAT APP IS RUNNING IS NOT DISPLAYED ONTO THE PI 
-# APP BLOCK FEATURE IS NOT WORKING 
-# WHICH APP ARE INSTALLED IS NOT DISPLAYED ONTO THE DASHBOARD
-# RESCAN BUTTON DOES NOTHING
-# THE HISTORY TAB WORKS FINE WHEN REFRESHED BUT THE MESSAGES DONOT GO TO THE PI AND DISPLAY
-
+# working of guardian pc port .......
 
 
 

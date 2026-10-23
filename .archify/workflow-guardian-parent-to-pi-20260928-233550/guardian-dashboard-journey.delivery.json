@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "receiptId": "2cf602cd-a953-4f58-8108-6e34d9b90bb7",
+  "status": "current",
+  "command": "deliver",
+  "type": "workflow",
+  "input": "C:\\GUARDIAN\\.archify\\workflow-guardian-parent-to-pi-20260928-233550\\candidate.json",
+  "output": "C:\\GUARDIAN\\.archify\\workflow-guardian-parent-to-pi-20260928-233550\\guardian-dashboard-journey.html",
+  "specification": {
+    "sha256": "1344ea57f7b48d7ffe6134eb193aed4a245f28e540645b8c0d62db9409195a5f",
+    "bytes": 11649
+  },
+  "artifact": {
+    "sha256": "63b5a370971602517bb3cf4c91ec329052e0414805297c069c5361e91a471a0e",
+    "bytes": 782176
+  }
+}

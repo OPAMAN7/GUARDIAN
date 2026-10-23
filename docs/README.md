@@ -11,6 +11,7 @@ folder map:
 |-----------|-----|
 | `docs/MASTER_AI.md` | Architecture, file map, network config, the GUARD.bat command/menu reference, the hard rules, and what the last AI changed. |
 | `docs/SESSION_MEMORY.md` | Open bug queue, fix history, session log. Update it before you finish. |
+| `GUARDIAN PC/PLAN.md` | Active Windows-only child-device product plan, security boundaries, prerequisites, and AI workflow. |
 
 Everything is driven by one launcher — `GUARD.bat` in the project root:
 
@@ -49,6 +50,10 @@ GUARDIAN/
     watchdog/         # watchdog_server.py + nuh_uh assets
     launcher/         # one-click launcher source/exe
     config/           # guard_runtime.json = single source of truth for IPs/creds
+
+  GUARDIAN PC/
+    PLAN.md            # Windows-only child-device product plan; no Linux customer setup
+    design-reference/  # User-supplied Stitch parent-dashboard UI archive to wire into web-ts
 
   pi-agent/
     agent/            # Raspberry Pi monitored agent

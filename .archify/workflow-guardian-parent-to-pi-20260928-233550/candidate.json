@@ -1,0 +1,275 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "Guardian Dashboard: Parent Click to Raspberry Pi",
+    "subtitle": "UI tabs, live screen mirroring, and remote app control across the full journey",
+    "output": ".archify/workflow-guardian-parent-to-pi-20260928-233550/guardian-dashboard-journey.html",
+    "animation": "trace",
+    "visual_preset": "signal-flow",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/OPAMAN7/GUARDIAN.git",
+      "provider": "github",
+      "link_mode": "web",
+      "revision": "bee0b11333beecb4402dd5f1eb2cdc881d0b37dc"
+    }
+  },
+  "lanes": [
+    { "id": "parent_ui", "label": "Parent Dashboard UI" },
+    { "id": "server", "label": "Dashboard Server" },
+    { "id": "pi", "label": "Raspberry Pi Agent" },
+    { "id": "feedback", "label": "Live Updates + Feedback" }
+  ],
+  "phases": [
+    { "id": "choose", "label": "Choose device + app", "fromCol": 0, "toCol": 2 },
+    { "id": "command", "label": "Authenticated command path", "fromCol": 3, "toCol": 5, "variant": "emphasis" }
+  ],
+  "groups": [
+    { "id": "dashboard_tabs", "label": "Seven top-level dashboard tabs", "lane": "parent_ui", "fromCol": 0, "toCol": 2, "variant": "default" },
+    { "id": "apps_tabs", "label": "Apps workspace: four sub-tabs + actions", "lane": "parent_ui", "fromCol": 1, "toCol": 2, "variant": "emphasis" },
+    { "id": "remote_control", "label": "Socket.IO remote control", "lane": "server", "fromCol": 3, "toCol": 5, "variant": "security" },
+    { "id": "screen_mirroring", "label": "Screenshot mirror stream", "lane": "feedback", "fromCol": 1, "toCol": 5, "variant": "dashed" }
+  ],
+  "mainPath": ["parent", "dashboard", "device", "apps", "app_action", "api", "socket", "pi_command", "tracker"],
+  "nodes": [
+    {
+      "id": "parent",
+      "lane": "parent_ui",
+      "col": 0,
+      "type": "external",
+      "label": "Parent",
+      "sublabel": "opens dashboard",
+      "icon": "person",
+      "sources": [{ "path": "parent-dashboard/web-ts/main.js", "line": 2610, "end_line": 2690, "label": "navigation + device selection" }],
+      "width": 132
+    },
+    {
+      "id": "dashboard",
+      "lane": "parent_ui",
+      "col": 1,
+      "type": "frontend",
+      "label": "Guardian Dashboard",
+      "sublabel": "seven parent tabs",
+      "tag": "hash navigation",
+      "icon": "frontend",
+      "sources": [{ "path": "parent-dashboard/web-ts/main.js", "line": 1261, "end_line": 1300, "label": "top-level tabs" }],
+      "width": 150
+    },
+    {
+      "id": "device",
+      "lane": "parent_ui",
+      "col": 2,
+      "type": "frontend",
+      "label": "Selected Device",
+      "sublabel": "telemetry + apps + screen",
+      "tag": "device list click",
+      "icon": "active",
+      "sources": [
+        { "path": "parent-dashboard/web-ts/main.js", "line": 2680, "end_line": 2690, "label": "selection handler" },
+        { "path": "parent-dashboard/web-ts/main.js", "line": 788, "end_line": 812, "label": "apps overview load" }
+      ],
+      "width": 140
+    },
+    {
+      "id": "apps",
+      "lane": "parent_ui",
+      "col": 2,
+      "yOffset": 150,
+      "type": "frontend",
+      "label": "Apps Workspace",
+      "sublabel": "four Apps tabs + actions",
+      "tag": "active app hero",
+      "icon": "frontend",
+      "sources": [{ "path": "parent-dashboard/web-ts/main.js", "line": 1540, "end_line": 1595, "label": "Apps tabs + hero actions" }],
+      "width": 150
+    },
+    {
+      "id": "app_action",
+      "lane": "parent_ui",
+      "col": 2,
+      "yOffset": 310,
+      "type": "security",
+      "label": "Parent Clicks App Action",
+      "sublabel": "close, limit, message, block",
+      "tag": "confirm + selected device",
+      "icon": "active",
+      "sources": [{ "path": "parent-dashboard/web-ts/main.js", "line": 2965, "end_line": 3015, "label": "close and timer actions" }],
+      "width": 175
+    },
+    {
+      "id": "api",
+      "lane": "server",
+      "col": 3,
+      "type": "backend",
+      "label": "Authenticated REST API",
+      "sublabel": "close | timer | msg | block",
+      "tag": "validates device + action",
+      "icon": "backend",
+      "sources": [{ "path": "parent-dashboard/server-ts/routes/apps.js", "line": 294, "end_line": 330, "label": "remote close endpoint" }],
+      "width": 170
+    },
+    {
+      "id": "socket",
+      "lane": "server",
+      "col": 4,
+      "type": "messagebus",
+      "label": "Device Socket Bridge",
+      "sublabel": "Socket.IO bridge",
+      "tag": "offline returns 404",
+      "icon": "messagebus",
+      "sources": [{ "path": "parent-dashboard/server-ts/routes/apps.js", "line": 308, "end_line": 324, "label": "socket command emission" }],
+      "width": 160
+    },
+    {
+      "id": "pi_command",
+      "lane": "pi",
+      "col": 5,
+      "type": "backend",
+      "label": "Pi Agent Command Handler",
+      "sublabel": "app command handlers",
+      "tag": "off-read-loop",
+      "icon": "backend",
+      "sources": [{ "path": "pi-agent/agent/main.py", "line": 241, "end_line": 315, "label": "Socket.IO handlers" }],
+      "width": 190
+    },
+    {
+      "id": "tracker",
+      "lane": "pi",
+      "col": 5,
+      "yOffset": 150,
+      "type": "security",
+      "label": "App Tracker / Blocker",
+      "sublabel": "timer + process enforcement",
+      "tag": "child screen effect",
+      "icon": "active",
+      "sources": [{ "path": "pi-agent/agent/main.py", "line": 278, "end_line": 315, "label": "agent dispatch to tracker" }],
+      "width": 160
+    },
+    {
+      "id": "screenshot_capture",
+      "lane": "pi",
+      "col": 4,
+      "yOffset": 310,
+      "type": "frontend",
+      "label": "Screenshot Capture",
+      "sublabel": "captures + sends frames",
+      "tag": "low-latency mode",
+      "icon": "frontend",
+      "sources": [{ "path": "pi-agent/agent/main.py", "line": 409, "end_line": 425, "label": "send_screenshot" }],
+      "width": 140
+    },
+    {
+      "id": "server_stream",
+      "lane": "server",
+      "col": 3,
+      "yOffset": 330,
+      "type": "database",
+      "label": "Frame Cache + Persistence",
+      "sublabel": "cache latest + broadcast",
+      "tag": "live_screenshot",
+      "icon": "database",
+      "sources": [{ "path": "parent-dashboard/server-ts/index.js", "line": 469, "end_line": 510, "label": "screenshot handler" }],
+      "width": 175
+    },
+    {
+      "id": "live_view",
+      "lane": "feedback",
+      "col": 2,
+      "type": "frontend",
+      "label": "Live View + Output Controller",
+      "sublabel": "mirror + display controls",
+      "tag": "20 / 24 / 30 FPS profiles",
+      "icon": "frontend",
+      "sources": [{ "path": "parent-dashboard/web-ts/main.js", "line": 1325, "end_line": 1385, "label": "stream + display controls" }],
+      "width": 205
+    },
+    {
+      "id": "dashboard_update",
+      "lane": "feedback",
+      "col": 1,
+      "type": "messagebus",
+      "label": "Dashboard Updates",
+      "sublabel": "apps | timers | alerts",
+      "tag": "parent sees result",
+      "icon": "messagebus",
+      "sources": [
+        { "path": "parent-dashboard/server-ts/index.js", "line": 582, "end_line": 625, "label": "running app broadcasts" },
+        { "path": "parent-dashboard/web-ts/main.js", "line": 402, "end_line": 420, "label": "live screenshot listener" }
+      ],
+      "width": 160
+    },
+    {
+      "id": "presentation",
+      "lane": "feedback",
+      "col": 0,
+      "yOffset": 230,
+      "type": "frontend",
+      "label": "Presentation Mode",
+      "sublabel": "presentation / controller",
+      "tag": "optional live-only surface",
+      "icon": "frontend",
+      "sources": [{ "path": "windows-app/scripts/start-presentation.bat", "line": 1, "end_line": 77, "label": "presentation launcher" }],
+      "width": 150
+    }
+  ],
+  "edges": [
+    { "id": "open-dashboard", "from": "parent", "to": "dashboard", "label": "open Guardian", "variant": "emphasis", "role": "main" },
+    { "id": "select-device", "from": "dashboard", "to": "device", "label": "click device", "variant": "emphasis", "role": "main" },
+    { "id": "open-apps", "from": "device", "to": "apps", "label": "open Apps + load overview", "variant": "default", "role": "main" },
+    { "id": "click-app-action", "from": "apps", "to": "app_action", "label": "choose action", "variant": "security", "role": "main" },
+    { "id": "rest-command", "from": "app_action", "to": "api", "label": "POST /api/apps/...", "variant": "security", "role": "main" },
+    { "id": "socket-forward", "from": "api", "to": "socket", "label": "getDeviceSocket(deviceId)", "variant": "emphasis", "role": "main" },
+    { "id": "pi-command", "from": "socket", "to": "pi_command", "label": "Socket.IO event", "variant": "emphasis", "role": "main", "route": "up-channel" },
+    { "id": "execute-action", "from": "pi_command", "to": "tracker", "label": "execute on child display", "variant": "security", "role": "main" },
+    { "id": "report-state", "from": "tracker", "to": "dashboard_update", "label": "report app / timer / alert", "variant": "dashed", "role": "return", "route": "bottom-channel" },
+    { "id": "capture-frame", "from": "screenshot_capture", "to": "server_stream", "label": "screenshot", "variant": "dashed", "role": "async" },
+    { "id": "mirror-frame", "from": "server_stream", "to": "live_view", "label": "live_screenshot", "variant": "dashed", "role": "async" }
+  ],
+  "semanticChecks": {
+    "allowedRoots": ["parent", "screenshot_capture", "presentation"],
+    "allowedTerminals": ["dashboard_update", "live_view", "presentation"],
+    "requiredEdges": [
+      { "from": "app_action", "to": "api" },
+      { "from": "api", "to": "socket" },
+      { "from": "socket", "to": "pi_command" },
+      { "from": "screenshot_capture", "to": "server_stream" },
+      { "from": "server_stream", "to": "live_view" }
+    ]
+  },
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Every Dashboard Tab",
+      "items": [
+        "Live View: screen mirror, telemetry, stream FPS, quality, width, fit, zoom, brightness, contrast",
+        "Devices: registered device status and last-seen management",
+        "Apps: active app controls plus Live Running, Installed, Blocked Rules, Message History",
+        "Progress: academic activity, trends, breakdowns, goals, rules, and AI insight",
+        "Blocklist: custom blocked websites",
+        "Rules & Limits: category switches and custom URL rules",
+        "Alerts: alert history and mark-all-read"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "What an App Click Does",
+      "items": [
+        "The selected device is required before a remote action is sent",
+        "Close, timer, message, and block actions use authenticated REST endpoints",
+        "The server resolves the device Socket.IO connection and emits the Pi command",
+        "The agent runs the operation off the read loop, then reports state back"
+      ]
+    },
+    {
+      "dot": "orange",
+      "title": "Screen Mirroring Is Separate but Connected",
+      "items": [
+        "The Pi captures frames and sends screenshots to the server",
+        "The server persists selected frames, caches the latest frame, and broadcasts live_screenshot",
+        "Live View paints the selected device frame and can open an Output Controller window",
+        "Presentation mode is an optional display surface, not keyboard or mouse injection"
+      ]
+    }
+  ]
+}

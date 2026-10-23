@@ -648,6 +648,7 @@ Default admin login:  admin / admin123  CHANGE THIS (BUG-03)
 
 | Date       | What was done                                                                    |
 |------------|----------------------------------------------------------------------------------|
+| 2026-10-23 | Created/expanded `GUARDIAN PC/PLAN.md` for Windows-only child devices and added the supplied parent dashboard Stitch package at `GUARDIAN PC/design-reference/stitch_guardian_shield_parental_dashboard.zip`. The plan requires wiring its Live View, Progress, Devices, Apps, Blocklist, Rules & Limits, Sign In, Alerts, and time-extension modal into the existing `parent-dashboard/web-ts` app, replacing prototype data with real API state. It also prioritizes system-wide WFP/firewall and managed-browser path enforcement (e.g. block YouTube Shorts while allowing normal YouTube), with custom WFP driver work gated by evidence/signing/review. Planning only; no product code changed and no tests run. |
 | 2026-08-20 | Full codebase scan. All bugs and features identified.                            |
 | 2026-08-25 | BUG-01 FIXED: Cleaned up bloated DB from 1.28 GB to 3.3 MB (99.8% reduction).     |
 | 2026-08-26 | FEATURE F-11 COMPLETE: Live App Tracking, App Blocking, Timers & Child Messages. |

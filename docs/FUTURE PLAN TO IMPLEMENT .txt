@@ -1,0 +1,109 @@
+# Guardian OS: Comprehensive Architecture and Hardening Blueprint
+
+This document outlines the complete architectural strategy for transforming a standard Arch Linux installation on a Raspberry Pi into "Guardian OS"—a highly secure, tamper-resistant network appliance. 
+
+The goal is to move security out of easily bypassed user-space scripts and embed it deeply into the kernel, filesystem, and hardware layers.
+
+---
+
+## 1. Deep Packet Inspection & Network Filtering
+
+To stop advanced bypass techniques (like custom VPNs, WireGuard, Shadowsocks), simple port blocking is insufficient. You must analyze and control traffic at the lowest possible level.
+
+### A. eBPF and XDP (eXpress Data Path) Payload Inspection
+*   **What to do:** Write C programs that compile into eBPF bytecode. Attach these programs to your network interface (NIC) using XDP. Program the logic to inspect the payload of incoming/outgoing packets for specific VPN handshake signatures (e.g., OpenVPN's initial TLS handshake, WireGuard's static headers). 
+*   **What it will result in:** Unmatched performance and security. Packets are dropped at the driver level before the Linux kernel even allocates memory (skipping the TCP/IP stack entirely). Proxies and VPNs are physically blocked from establishing connections.
+*   **What to be careful of:** 
+    *   **Complexity:** Writing eBPF code requires strict adherence to kernel safety rules (the kernel verifier will reject loops or unverified memory access).
+    *   **False Positives:** If your signature matching is too broad, you will drop legitimate web traffic, breaking standard internet access.
+
+### B. Default-Drop Networking with `nftables`
+*   **What to do:** Completely remove `iptables` and deploy `nftables`. Configure a base chain with a default policy of `drop`. Explicitly whitelist only required traffic (e.g., output on ports 80/443 for web, stateful replies).
+*   **What it will result in:** A closed-by-default network posture. If an application tries to use a non-standard port for a proxy, the traffic goes into a black hole.
+*   **What to be careful of:**
+    *   **Lockout:** If you don't whitelist SSH (port 22) from your specific management IP, you will permanently lock yourself out of the device over the network.
+    *   **DNS/NTP Failure:** You must explicitly allow DNS (53) and NTP (123) for system time and name resolution to function.
+
+### C. Blocking Encrypted DNS (DoH/DoT) Circumvention
+*   **What to do:** Use `nftables` to redirect all standard port 53 traffic to your local, filtered DNS resolver. Simultaneously, use eBPF to inspect outbound TLS Client Hello packets on port 443. Extract the Server Name Indication (SNI). If the SNI matches known DNS-over-HTTPS providers (e.g., `cloudflare-dns.com`), drop the packet.
+*   **What it will result in:** Users cannot bypass your DNS blocklists by switching their browser to use secure DNS or changing their device's DNS server.
+*   **What to be careful of:**
+    *   **Encrypted Client Hello (ECH):** Modern protocols are beginning to encrypt the SNI. If ECH becomes widely adopted, eBPF won't be able to read the domain name. You will have to fall back to IP-based blocking of known DoH servers.
+
+---
+
+## 2. Immutable and Tamper-Proof Storage
+
+If a user gains access, they will try to delete your scripts or download proxy clients. The filesystem must resist permanent changes.
+
+### A. Ephemeral Runtime (OverlayFS)
+*   **What to do:** Configure the bootloader/fstab to mount the root `/` partition as read-only. Mount a `tmpfs` (RAM disk) overlay on top of it. All file writes during normal operation are written to RAM, not the SD card.
+*   **What it will result in:** Complete system amnesia on reboot. If a user downloads malware, edits a config, or deletes a security script, pulling the power plug and rebooting instantly restores the OS to its pristine, secure state. It also prevents SD card corruption from constant writes.
+*   **What to be careful of:**
+    *   **Data Loss:** Legitimate logs or persistent data (like Wi-Fi credentials) will also be lost on reboot unless you configure a specific, tightly controlled mount point (e.g., `/var/log` or `/etc/NetworkManager`) that writes directly to disk.
+    *   **Updates:** You must build a "maintenance mode" script that remounts the filesystem as read-write to install OS updates, then locks it back down.
+
+### B. Cryptographic Integrity (`dm-verity`)
+*   **What to do:** Compile a read-only root filesystem image. Generate a cryptographic hash tree of the image and append it to the disk. Configure the kernel to use `dm-verity` to verify every block of data as it is read from the SD card.
+*   **What it will result in:** Protection against offline tampering. If someone removes the SD card, puts it in their laptop, and modifies your security scripts, the OS will refuse to boot or kernel panic the moment it tries to read the tampered file.
+*   **What to be careful of:**
+    *   **Complex Updates:** You can no longer run `pacman -Syu` to update. You must build a completely new OS image, generate a new hash tree, and flash the entire system for every update.
+    *   **Bootloader Trust:** `dm-verity` is useless if the attacker modifies the bootloader to ignore it. This requires Secure Boot (verifying the bootloader signature via hardware fuses), which is complex on Raspberry Pi.
+
+---
+
+## 3. Mandatory Access Control (Process Layer)
+
+Standard Linux permissions (root vs. user) are not enough.
+
+### A. AppArmor Profiles
+*   **What to do:** Enable AppArmor in the kernel parameters. Write strict profiles for every application and script running on Guardian OS. 
+*   **What it will result in:** Process confinement. Even if a user escalates to `root`, if they execute a binary that isn't whitelisted, or if a whitelisted binary tries to open a network socket it shouldn't, AppArmor physically denies the action at the kernel level.
+*   **What to be careful of:**
+    *   **Profile Maintenance:** AppArmor profiles are notoriously difficult to get perfectly right. A profile that is too strict will crash legitimate system processes. You must thoroughly test using `aa-logprof` in complain mode before enforcing.
+
+### B. Systemd Service Sandboxing
+*   **What to do:** Edit the `systemd` unit files for all background services. Add directives like `ProtectSystem=strict`, `PrivateTmp=true`, `NoNewPrivileges=true`, and `ProtectControlGroups=true`.
+*   **What it will result in:** Daemons are isolated. If a vulnerability in a background service is exploited, the attacker is trapped inside a sandbox with no access to the real filesystem or kernel tunables.
+*   **What to be careful of:**
+    *   **Service Failures:** Many older or poorly written daemons expect full access to `/var` or `/run`. Sandboxing them might cause them to fail on startup.
+
+---
+
+## 4. Kernel and Hardware Hardening
+
+Lock down the foundational layers of the device to prevent system-level circumvention.
+
+### A. Kernel Parameter Lockdown (`sysctl`)
+*   **What to do:** Create a file in `/etc/sysctl.d/99-guardian.conf`. Set `net.ipv4.ip_forward = 0`, `net.ipv6.conf.all.disable_ipv6 = 1`, and `kernel.dmesg_restrict = 1`.
+*   **What it will result in:** 
+    *   Disabling IP forwarding ensures the Pi cannot be used as a rogue router.
+    *   Disabling IPv6 closes a massive loophole (proxies love to tunnel over IPv6 when IPv4 is blocked).
+    *   Restricting `dmesg` hides kernel logs so attackers cannot see what your eBPF filters are doing.
+*   **What to be careful of:**
+    *   If your local network infrastructure relies entirely on IPv6, the device will lose connectivity.
+
+### B. Hardware Watchdog & Self-Healing
+*   **What to do:** Enable the BCM2835 hardware watchdog timer in `/boot/config.txt`. Write a "heartbeat" script that checks if eBPF rules are loaded and network rules are active. If everything is fine, the script pings `/dev/watchdog`.
+*   **What it will result in:** Absolute resilience. If a user manages to kill your security script, or if the system freezes due to an attack, the heartbeat stops. The physical hardware will forcefully cut power and reboot the Pi within 15 seconds, restoring the immutable, secure state.
+*   **What to be careful of:**
+    *   **Boot Loops:** If your heartbeat script contains a bug and fails to ping the watchdog on startup, the device will reboot endlessly.
+
+### C. USB & Peripheral Lockdown (`USBGuard`)
+*   **What to do:** Install `usbguard`. Create a policy that blocks all devices by default, specifically targeting class `02h` (Network/Communications) and `08h` (Mass Storage). Explicitly allow only class `03h` (Human Interface Devices like keyboards).
+*   **What it will result in:** Users cannot plug in a 4G/5G USB modem, an Ethernet dongle, or tether their phone to bypass the Guardian OS network filters.
+*   **What to be careful of:**
+    *   **Keyboard Lockout:** If you misconfigure the HID whitelist, plugging in a keyboard for local debugging won't work, forcing you to rely entirely on SSH.
+
+### D. Terminal & Kiosk Locking
+*   **What to do:** Mask virtual console services using `systemctl mask getty@tty1.service` (up to tty6). Boot directly into a single-application Wayland kiosk environment (e.g., using `cage` or `sway`). Disable magic SysRq keys.
+*   **What it will result in:** Eliminates local shell access. A user plugging in a monitor and keyboard will only see the UI you provide and cannot drop to a command prompt to execute code.
+*   **What to be careful of:**
+    *   **Debugging Nightmare:** Without local TTY access, if the network fails and SSH drops, the device is completely inaccessible and must be re-flashed.
+```eof
+
+I have combined all the architectural layers—from kernel-level eBPF packet inspection and immutable storage to hardware watchdogs and USB restrictions—into a detailed master document.
+
+Because this is a highly advanced setup, I strongly recommend implementing this in stages. The easiest place to start, and the one that will provide the most immediate return on investment for stability, is the **OverlayFS (Immutable Filesystem)**. 
+
+Which piece of this architecture would you like to start configuring first? I can guide you through the exact setup and commands for any of these layers.

@@ -9,6 +9,7 @@ GUARD - Guardian unified sci-fi launcher
 from __future__ import annotations
 
 import json
+import ipaddress
 import os
 import re
 import shlex
@@ -183,11 +184,10 @@ def save_cfg(cfg: Dict[str, str]) -> None:
 
 
 def boot_sequence(name: str, steps: List[str]) -> None:
-    print(C.CYAN + f"[INIT] {name}" + C.RESET)
+    """Show planned phases without claiming they succeeded in advance."""
+    print(C.CYAN + f"[PLAN] {name}" + C.RESET)
     for step in steps:
-        print(C.DIM + f"  -> {step}..." + C.RESET)
-        time.sleep(0.28)
-    print(C.GREEN + f"  -> {name} sequence complete" + C.RESET)
+        print(C.DIM + f"  - {step}" + C.RESET)
     print()
 
 
@@ -236,6 +236,43 @@ def get_local_ipv4s() -> List[str]:
             seen.add(ip)
             ordered.append(ip)
     return ordered
+
+
+def flush_network_caches() -> None:
+    """Flush DNS and ARP caches so stale entries from the previous network
+    cannot mislead Pi detection or make a dead IP appear reachable.
+
+    Both commands require elevation on a locked-down machine, but on a normal
+    home/dev Windows box they succeed silently. Failures are non-fatal."""
+    for cmd in ("ipconfig /flushdns", "netsh interface ip delete arpcache"):
+        try:
+            subprocess.run(
+                cmd, shell=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+
+def verify_local_ip_bound(ip: str) -> bool:
+    """Return True if *ip* is actually assigned to a local interface right now.
+
+    Catches the case where the cached host IP belongs to a network we have
+    since disconnected from — subnet-matching would still pick it if the old
+    adapter is still enumerated but down."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.bind((ip, 0))
+            return True
+        except OSError:
+            return False
+        finally:
+            s.close()
+    except Exception:
+        return False
 
 
 def same_subnet_24(ip1: str, ip2: str) -> bool:
@@ -289,36 +326,41 @@ def choose_host_ip(local_ips: List[str], pi_ip: str) -> str:
     return local_ips[0]
 
 
-def detect_pi_ip(cfg: Dict[str, str], local_ips: List[str]) -> Optional[str]:
-    cached = cfg.get("last_pi_ip", "").strip()
-    if cached and tcp_open(cached, 22, 0.3):
-        return cached
+def detect_pi_ip(cfg: Dict[str, str], local_ips: List[str],
+                 retries: int = 2, verbose: bool = True) -> Optional[str]:
+    """Probe one explicitly selected Pi IP or the cached IP only.
 
-    resolved = resolve_hostname_ip(cfg["pi_hostname"])
-    if resolved and tcp_open(resolved, 22, 0.3):
-        return resolved
+    Asking before the first probe prevents a random SSH server on another
+    adapter/subnet from being mistaken for the Pi.
+    """
+    cached = (cfg.get("last_pi_ip") or "").strip()
+    choice = input(f"Pi IP to use [auto = cached {cached or 'not set'}]: ").strip()
+    if not choice or choice.lower() == "auto":
+        target = cached
+        if not target:
+            print(C.RED + "No cached Pi IP is set. Enter the Pi IP manually." + C.RESET)
+            return None
+        source = "cached"
+    else:
+        try:
+            target = str(ipaddress.IPv4Address(choice))
+        except ipaddress.AddressValueError:
+            print(C.RED + "Invalid Pi IPv4 address. No other addresses will be scanned." + C.RESET)
+            return None
+        source = "manual"
 
-    prefixes = sorted({".".join(ip.split(".")[:3]) for ip in local_ips})
-    own = set(local_ips)
-    for prefix in prefixes:
-        print(C.DIM + f"Scanning {prefix}.0/24 for Pi SSH..." + C.RESET)
-        # Never treat this machine's own SSH server as the Pi.
-        hits = [ip for ip in scan_subnet_for_ssh(prefix) if ip not in own]
-        if not hits:
-            continue
-        if len(hits) == 1:
-            return hits[0]
+    timeouts = [0.8, 1.5, 2.5]
+    for attempt in range(retries + 1):
+        timeout = timeouts[min(attempt, len(timeouts) - 1)]
+        if attempt and verbose:
+            print(C.DIM + f"  Retry {attempt}/{retries} to {target} (timeout {timeout}s)..." + C.RESET)
+            time.sleep(float(attempt))
+        if tcp_open(target, 22, timeout):
+            if verbose:
+                print(C.GREEN + f"SSH port answered at {target} ({source} IP)." + C.RESET)
+            return target
 
-        print(C.YELLOW + "Multiple SSH hosts found:" + C.RESET)
-        for idx, ip in enumerate(hits, start=1):
-            print(f"  {idx}. {ip}")
-        pick = input("Choose Pi IP number (or Enter to skip): ").strip()
-        if pick.isdigit() and 1 <= int(pick) <= len(hits):
-            return hits[int(pick) - 1]
-
-    manual = input("Pi IP not auto-detected. Enter Pi IP manually: ").strip()
-    if manual:
-        return manual
+    print(C.RED + f"No SSH response at selected Pi IP {target}. No other IPs were tried." + C.RESET)
     return None
 
 
@@ -363,65 +405,105 @@ def _kill_listeners_on_port(port: int) -> int:
 
 
 def _quick_detect_pi_ip(cfg: Dict[str, str]) -> Optional[str]:
-    cached = cfg.get("last_pi_ip", "").strip()
-    if cached and tcp_open(cached, 22, 0.3):
+    """Check only GUARD's cached Pi address; never resolve or scan other hosts."""
+    cached = (cfg.get("last_pi_ip") or "").strip()
+    if cached and tcp_open(cached, 22, 0.8):
         return cached
-
-    resolved = resolve_hostname_ip(cfg["pi_hostname"])
-    if resolved and tcp_open(resolved, 22, 0.3):
-        return resolved
-
     return None
 
 
 def recalibrate_pi_sync(cfg: Dict[str, str], restart_agent: bool) -> bool:
+    """Re-point the Pi agent at the current dashboard IP and restart it.
+
+    This is the lightweight counterpart of deploy_pi_agent: no file upload,
+    just IP resolution, config patch, service restart, and verification.
+
+    Improvements over the original implementation:
+    - Flushes DNS and ARP caches before probing so a network change is visible.
+    - Validates that the chosen host IP is actually bound to a local interface.
+    - Uses retrying Pi detection with increasing timeouts for settling networks.
+    - Ends with a full verify_pi_online check (Pi service + Pi→dashboard curl).
+    - Warns if the local pi-agent/agent/config.json was left stale.
+    """
     if not (shutil.which("ssh") or shutil.which("plink")):
         print(C.RED + "No SSH client found in PATH (need OpenSSH 'ssh' or PuTTY 'plink')." + C.RESET)
         return False
 
+    # ── Phase 0: flush stale caches from the previous network ─────────────
+    print(C.BLUE + "Flushing DNS and ARP caches..." + C.RESET)
+    flush_network_caches()
+
+    # ── Phase 1: discover the local network and the Pi ────────────────────
     local_ips = get_local_ipv4s()
     if not local_ips:
-        print(C.RED + "No active local IPv4 found." + C.RESET)
+        print(C.RED + "No active local IPv4 found — is Wi-Fi/ethernet connected?" + C.RESET)
         return False
 
     print(C.BLUE + f"Local IPv4 candidates: {', '.join(local_ips)}" + C.RESET)
-    pi_ip = detect_pi_ip(cfg, local_ips)
+    pi_ip = detect_pi_ip(cfg, local_ips, retries=2, verbose=True)
     if not pi_ip:
         print(C.RED + "Could not determine Pi IP." + C.RESET)
         return False
+    print(C.GREEN + f"Pi found at {pi_ip}" + C.RESET)
 
+    # ── Phase 2: resolve the host (dashboard) IP ──────────────────────────
     host_ip = resolve_host_ip(cfg, local_ips, pi_ip)
     if not host_ip:
         print(C.RED + "Could not determine the dashboard host IP." + C.RESET)
         return False
-    port = cfg.get("server_port", "3000")
 
+    # Never publish a URL that is stale or guessed from an unrelated adapter.
+    if not verify_local_ip_bound(host_ip):
+        print(C.RED + f"Cannot use {host_ip}: it is not bound to an active local interface." + C.RESET)
+        return False
+
+    port = cfg.get("server_port", "3000")
+    if not tcp_open("127.0.0.1", int(port), 1.0):
+        print(C.RED + f"Dashboard is not listening on port {port}; start it before recalibrating." + C.RESET)
+        return False
+    auto_server_ip = (cfg.get("server_ip", "auto") or "auto").strip().lower() == "auto"
+    if auto_server_ip and not same_subnet_24(host_ip, pi_ip):
+        print(C.RED + f"Automatic address selection found host={host_ip} and Pi={pi_ip} "
+              "on different /24 networks." + C.RESET)
+        print(C.YELLOW + "Connect the PC and Pi to the same network, or set a fixed, "
+              "Pi-reachable dashboard IP with menu option I / GUARD.bat ip <addr>." + C.RESET)
+        return False
     if same_subnet_24(host_ip, pi_ip):
         print(C.GREEN + f"Subnet aligned: host={host_ip}, pi={pi_ip}" + C.RESET)
     else:
-        print(C.YELLOW + f"Different /24 detected: host={host_ip}, pi={pi_ip}. Continuing anyway." + C.RESET)
+        print(C.YELLOW + f"Using explicitly configured host={host_ip} for Pi={pi_ip}; "
+              "reachability will be checked after the update." + C.RESET)
 
     boot_sequence("NETWORK RECALIBRATION", [
+        "Flush network caches",
         "Resolve active host network",
         "Find Pi endpoint",
+        "Validate host IP binding",
         "Patch Pi server_url",
         "Commit sync profile",
+        "End-to-end verification",
     ])
+
+    # ── Phase 3: patch only the IP explicitly selected above.
+    if not remote_configure_and_start(cfg, pi_ip, cfg["pi_install_dir"], host_ip,
+                                      port, cfg["pi_service"], restart_agent):
+        print(C.RED + "Pi configuration/restart failed. No other Pi IP was tried "
+              "and no local IP settings were changed." + C.RESET)
+        return False
+
+    # ── Phase 4: verify end-to-end before committing local settings.
+    if not verify_pi_online(cfg, pi_ip, host_ip, port, require_reachability=True):
+        print(C.RED + "Recalibration did not pass service and dashboard reachability checks; "
+              "local IP settings were not changed." + C.RESET)
+        return False
 
     print(C.BLUE + "Updating local repo configs (source of truth):" + C.RESET)
     for note in apply_ip_locally(host_ip, port):
         print("  - " + note)
-
-    # /opt/guardian-agent/config.json is root-owned on deployed Pi setups.
-    if not remote_configure_and_start(cfg, pi_ip, cfg["pi_install_dir"], host_ip,
-                                      port, cfg["pi_service"], restart_agent):
-        print(C.RED + "Pi config/restart did not complete — see the cause above." + C.RESET)
-        return False
-
     cfg["last_pi_ip"] = pi_ip
     cfg["last_host_ip"] = host_ip
     save_cfg(cfg)
-    print(C.GREEN + f"Sync complete. Pi now points to http://{host_ip}:{port}" + C.RESET)
+    print(C.GREEN + f"Recalibration verified. Pi points to http://{host_ip}:{port}" + C.RESET)
     return True
 
 
@@ -860,8 +942,9 @@ def remote_configure_and_start(cfg: Dict[str, str], pi_ip: str, install: str,
             print(C.RED + f"  {service} did not come up." + C.RESET)
             pi_journal_tail(cfg, pi_ip, service, 40)
         else:
-            print(C.RED + f"SSH to {cfg['pi_username']}@{pi_ip} failed (exit {rc}) — "
-                  "wrong password, or the Pi is unreachable." + C.RESET)
+            print(C.RED + f"SSH to {cfg['pi_username']}@{pi_ip} failed (exit {rc}). "
+                  "The address may be stale, SSH may be resetting connections, or "
+                  "the login may be rejected." + C.RESET)
         return False
 
     ssh_ok, sudo_ok, detail = probe_ssh_and_sudo(cfg, pi_ip)
@@ -926,40 +1009,53 @@ def _marker(text: str, key: str) -> str:
 
 
 
-def verify_pi_online(cfg: Dict[str, str], pi_ip: str, host_ip: str, port: str) -> bool:
-    """Confirm the agent service is running and the Pi can see the dashboard."""
+def verify_pi_online(cfg: Dict[str, str], pi_ip: str, host_ip: str, port: str,
+                     require_reachability: bool = False) -> bool:
+    """Confirm the service and Pi-to-dashboard path without hiding SSH prompts."""
     svc = cfg["pi_service"]
     print(C.BLUE + "Verifying deployment..." + C.RESET)
-
-    rc, out = ssh_capture(cfg, pi_ip, f"systemctl is-active {shlex.quote(svc)}", timeout=25)
-    active = out.splitlines()[-1].strip() if out else ""
-    svc_ok = (active == "active") or (rc == 0 and "inactive" not in out and "failed" not in out)
-    print(f"  Pi service '{svc}': " +
-          (C.GREEN + "active" + C.RESET if svc_ok else C.RED + f"NOT active ({active or 'unknown'})" + C.RESET))
-
-    health = (f"curl -m 5 -s -o /dev/null -w '%{{http_code}}' "
-              f"http://{host_ip}:{port}/api/health || echo down")
-    _, out2 = ssh_capture(cfg, pi_ip, health, timeout=20)
-    code = out2.splitlines()[-1].strip() if out2 else ""
-    reach_ok = code.startswith("2")
-    print(f"  Pi -> dashboard http://{host_ip}:{port}/api/health: " +
-          ((C.GREEN + code + C.RESET) if reach_ok else (C.YELLOW + (code or "no response") + C.RESET)))
-
     dash_ok = tcp_open("127.0.0.1", int(port), 1.0)
+
+    if _unattended_ssh(cfg):
+        rc, out = ssh_capture(cfg, pi_ip,
+                              f"systemctl is-active {shlex.quote(svc)}", timeout=25)
+        active = out.splitlines()[-1].strip() if out else ""
+        svc_ok = (active == "active") or (rc == 0 and "inactive" not in out and "failed" not in out)
+        health = (f"curl -m 5 -s -o /dev/null -w '%{{http_code}}' "
+                  f"http://{host_ip}:{port}/api/health || echo down")
+        _, out2 = ssh_capture(cfg, pi_ip, health, timeout=20)
+        code = out2.splitlines()[-1].strip() if out2 else ""
+        reach_ok = code.startswith("2")
+        print(f"  Pi service '{svc}': " +
+              (C.GREEN + "active" + C.RESET if svc_ok else C.RED + f"NOT active ({active or 'unknown'})" + C.RESET))
+        print(f"  Pi -> dashboard http://{host_ip}:{port}/api/health: " +
+              ((C.GREEN + code + C.RESET) if reach_ok else (C.RED + (code or "no response") + C.RESET)))
+    else:
+        # Capturing OpenSSH hides its password prompt. Stream this check to the
+        # terminal and use the remote exit status as the end-to-end result.
+        print(C.YELLOW + "OpenSSH will prompt for the Pi password to verify service and dashboard reachability." + C.RESET)
+        remote = (
+            f"state=$(systemctl is-active {shlex.quote(svc)} 2>/dev/null); "
+            f"echo \"Pi service {svc}: $state\"; "
+            f"[ \"$state\" = active ] || exit 91; "
+            f"code=$(curl -m 5 -s -o /dev/null -w '%{{http_code}}' "
+            f"http://{host_ip}:{port}/api/health || echo down); "
+            f"echo \"Pi -> dashboard HTTP: $code\"; "
+            "case \"$code\" in 2*) exit 0;; *) exit 92;; esac"
+        )
+        rc = ssh_exec(cfg, pi_ip, remote, tty=True, timeout=45)
+        svc_ok = rc == 0
+        reach_ok = rc == 0
+        print("  Remote service and Pi -> dashboard checks: " +
+              (C.GREEN + "passed" + C.RESET if rc == 0
+               else C.RED + f"failed (SSH/remote exit {rc})" + C.RESET))
+
     print(f"  Local dashboard port {port}: " +
           (C.GREEN + "listening" + C.RESET if dash_ok
-           else C.YELLOW + "not listening (start it with option 1)" + C.RESET))
-
-    # The Pi agent is what this function is verifying. A dashboard that happens
-    # not to be running is a local matter and must not fail the deploy — that
-    # false negative is why `GUARD.bat deploy` reported failure after a good push.
-    ok = svc_ok
-    if ok and not dash_ok:
-        print(C.YELLOW + "Pi agent is up, but nothing is listening on port "
-              f"{port} here — start the dashboard with option 1 or the Pi has "
-              "nowhere to report to." + C.RESET)
+           else C.RED + "not listening (start it with option 1)" + C.RESET))
+    ok = svc_ok and (not require_reachability or (reach_ok and dash_ok))
     print((C.GREEN + "Verification PASSED." if ok
-           else C.YELLOW + "Verification incomplete — review the lines above.") + C.RESET)
+           else C.RED + "Verification FAILED — review the lines above.") + C.RESET)
     return ok
 
 
@@ -2198,9 +2294,29 @@ def run_cli(argv: List[str]) -> int:
             return 1
         return 0 if pull_pi_data(cfg, pi_ip) else 1
 
+    if cmd in ("pi-ip", "piip"):
+        if len(argv) < 2:
+            print(C.RED + "Usage: GUARD.bat pi-ip <current-Pi-IPv4>" + C.RESET)
+            return 2
+        try:
+            cfg["last_pi_ip"] = str(ipaddress.IPv4Address(argv[1]))
+        except ipaddress.AddressValueError:
+            print(C.RED + f"Invalid IPv4 address: {argv[1]}" + C.RESET)
+            return 2
+        save_cfg(cfg)
+        print(C.GREEN + f"Pi target IP saved as {cfg['last_pi_ip']}." + C.RESET)
+        print(C.DIM + "This updates GUARD's connection target; the Pi's DHCP/static "
+              "address is managed by the network/router." + C.RESET)
+        return 0
+
+    if cmd in ("recalibrate", "recal", "resync", "network"):
+        cfg_fresh = load_cfg()
+        ok = recalibrate_pi_sync(cfg_fresh, restart_agent=True)
+        return 0 if ok else 1
+
     print(C.RED + f"Unknown command: {cmd}" + C.RESET)
-    print("Commands: deploy | verify | diag | build | progress | telegram [test] | "
-          "datapull | ip <addr> [port] | status")
+    print("Commands: deploy | verify | recalibrate | pi-ip <addr> | diag | build | progress | "
+          "telegram [test] | datapull | ip <addr> [port] | status")
     return 2
 
 
